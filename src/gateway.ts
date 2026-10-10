@@ -110,6 +110,12 @@ export class Gateway {
       for (const key of ["refreshToken", "idToken", "expiresAt", "refreshState"]) delete previous[key];
       if ("accountId" in patch.credentials && !("accessToken" in patch.credentials)) delete previous["accessToken"];
     }
+    // A thread the operator picks is theirs: it must not inherit the previous thread's "gateway created this" mark or its
+    // image count, or the adapter would skip its identity gate, rotate away from it at once and archive it.
+    if (account.provider === "dots" && patch.credentials && "threadId" in patch.credentials &&
+      patch.credentials["threadId"] !== previous["threadId"]) {
+      for (const key of ["threadOrigin", "threadImageBytes"]) delete previous[key];
+    }
     const updated = this.store.saveAccount({
       ...account, label: patch.label ?? account.label, enabled: patch.enabled ?? account.enabled,
       ...(patch.credentials ? { status: "unconnected", detail: "Credentials changed. Check connection again.", checkedAt: null } as const : {}),

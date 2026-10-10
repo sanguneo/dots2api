@@ -378,6 +378,30 @@ describe("account isolation and job state", () => {
     expect(store.credentials(a.id)["accessToken"]).toBe("secret");
     expect(gateway.account(a.id).label).toBe("New");
   });
+  test("a Dot thread the operator picks does not inherit the replaced thread's rotation state", () => {
+    // Given an account running on a thread this gateway created, with image content recorded on it.
+    const { gateway, store } = fixture();
+    const a = gateway.create("dots", "Rotated", {
+      accessToken: "secret", threadId: "gateway-thread", threadOrigin: "self", threadImageBytes: "9000000",
+    });
+    // When the operator points the account at a different thread in the console.
+    gateway.update(a.id, { credentials: { threadId: "operator-thread" } });
+    // Then that thread is not marked as gateway-created and starts with no image count, so it is never archived.
+    const credentials = store.credentials(a.id);
+    expect(credentials["threadId"]).toBe("operator-thread");
+    expect(credentials["accessToken"]).toBe("secret");
+    expect(credentials["threadOrigin"]).toBeUndefined();
+    expect(credentials["threadImageBytes"]).toBeUndefined();
+  });
+  test("re-saving the same Dot thread keeps its rotation state", () => {
+    // Given an account on a gateway-created thread with a recorded image count.
+    const { gateway, store } = fixture();
+    const a = gateway.create("dots", "Same", { threadId: "gateway-thread", threadOrigin: "self", threadImageBytes: "9000000" });
+    // When the console saves the same thread ID again.
+    gateway.update(a.id, { credentials: { threadId: "gateway-thread" } });
+    // Then nothing about that thread is forgotten.
+    expect(store.credentials(a.id)).toMatchObject({ threadOrigin: "self", threadImageBytes: "9000000" });
+  });
   test("accepts long async job input without truncating the provider prompt", async () => {
     // Given a ready provider and an input above the old 100,000-character limit.
     let received = "";
