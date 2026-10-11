@@ -313,10 +313,11 @@ const threadsHtml = `<!doctype html><html><body>
 describe("Muse side-chat pruning", () => {
   let dataDir: string;
   let server: ReturnType<typeof Bun.serve>;
-  let site: string;
+  let adapter: ReturnType<typeof createMuseAdapter>;
   const deleted: string[] = [];
   const account = accountIdSchema.parse("44444444-4444-4444-8444-444444444444");
-  const context = () => ({ accountId: account, dataDir, signal: new AbortController().signal });
+  /** The account's context switch, exactly as the gateway passes it to the adapter. */
+  const context = (keepContext: boolean) => ({ accountId: account, dataDir, signal: new AbortController().signal, keepContext });
 
   beforeAll(async () => {
     dataDir = await mkdtemp(join(tmpdir(), "dots2api-muse-prune-"));
@@ -330,40 +331,54 @@ describe("Muse side-chat pruning", () => {
         return new Response("gone", { headers: { "content-type": "text/html" } });
       },
     });
-    site = `http://localhost:${server.port}`;
-    await createMuseAdapter(site, 2_000, false).check({ cookieHeader: "hatch_sess=valid" }, context());
+    adapter = createMuseAdapter(`http://localhost:${server.port}`, 2_000);
+    await adapter.check({ cookieHeader: "hatch_sess=valid" }, context(true));
   });
 
   afterAll(async () => {
+    delete process.env["DOTS2API_MUSE_PRUNE_THREADS"];
     server.stop(true);
     await rm(dataDir, { recursive: true, force: true });
   });
 
-  it("leaves every side chat in place when pruning is off", async () => {
-    // Given pruning switched off.
+  it("keeps every side chat while the account keeps context", async () => {
+    // Given an account that keeps context.
     deleted.length = 0;
     // When a job completes.
-    const result = await createMuseAdapter(site, 2_000, false).run({}, "hello", context());
+    const result = await adapter.run({}, "hello", context(true));
     // Then the job succeeds and nothing is deleted.
     expect(result).toEqual({ text: "Done", remoteId: "side-1" });
     expect(deleted).toEqual([]);
   }, 60_000);
 
-  it("deletes only the side chat this job opened when pruning is on", async () => {
-    // Given pruning switched on.
+  it("keeps side chats while context is on even if the retired environment flag is still set", async () => {
+    // Given a host that still carries DOTS2API_MUSE_PRUNE_THREADS=1 from before the console switch existed.
+    deleted.length = 0;
+    process.env["DOTS2API_MUSE_PRUNE_THREADS"] = "1";
+    const leftover = createMuseAdapter(`http://localhost:${server.port}`, 2_000);
+    // When a job runs on an account that keeps context.
+    const result = await leftover.run({}, "hello", context(true));
+    delete process.env["DOTS2API_MUSE_PRUNE_THREADS"];
+    // Then the switch wins: deletion cannot be undone, so nothing is deleted behind it.
+    expect(result).toEqual({ text: "Done", remoteId: "side-1" });
+    expect(deleted).toEqual([]);
+  }, 60_000);
+
+  it("deletes only the side chat this job opened when context is off", async () => {
+    // Given an account whose context switch is off.
     deleted.length = 0;
     // When a job completes.
-    const result = await createMuseAdapter(site, 2_000, true).run({}, "hello", context());
+    const result = await adapter.run({}, "hello", context(false));
     // Then the result is unchanged and only the open thread's row was deleted, never the other chat.
     expect(result).toEqual({ text: "Done", remoteId: "side-1" });
     expect(deleted).toEqual(["Current"]);
   }, 60_000);
 
   it("deletes nothing when no row is marked as the open thread", async () => {
-    // Given pruning on but Muse never marking which row is the open thread.
+    // Given context off but Muse never marking which row is the open thread.
     deleted.length = 0;
     // When a job completes.
-    const result = await createMuseAdapter(site, 2_000, true).run({}, "hello unmarked", context());
+    const result = await adapter.run({}, "hello unmarked", context(false));
     // Then the job still succeeds and no row is guessed at.
     expect(result).toEqual({ text: "Done", remoteId: "side-1" });
     expect(deleted).toEqual([]);

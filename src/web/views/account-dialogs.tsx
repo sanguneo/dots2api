@@ -107,8 +107,8 @@ export function AccountDrawer({ account, onClose }: { readonly account: Account;
   const blocked = saving !== null || provider === null || gone || busy;
   const keepContextNote =
     account.provider === "muse"
-      ? "Muse는 작업마다 새 스레드를 엽니다. 끄면 작업이 남기는 사이드 챗을 정리합니다."
-      : "켜면 계정의 스레드 하나를 계속 쓰고 이미지 예산을 넘으면 교체합니다. 끄면 작업마다 새 스레드를 열고 끝나면 아카이브합니다.";
+      ? "Muse는 작업마다 새 대화를 엽니다. 켜 두면 그 대화가 Muse 앱의 사이드 챗으로 남고, 끄면 작업이 성공한 뒤 그 사이드 챗을 삭제합니다. 삭제는 되돌릴 수 없습니다."
+      : "켜 두면 계정의 대화 하나를 계속 쓰고, 이미지가 많이 쌓이면 새 대화로 교체합니다. 끄면 작업마다 새 대화를 열고 끝나면 보관합니다. 앞사람의 프롬프트와 이미지가 다음 작업에 남지 않고, 계정에 저장된 대화는 그대로라 다시 켜면 이어서 씁니다.";
 
   async function save(mode: SaveMode): Promise<void> {
     if (blocked || provider === null) return;
@@ -218,16 +218,16 @@ export function AccountDrawer({ account, onClose }: { readonly account: Account;
 
         <div className="form__section">
           <div className="form__section-head">
-            <p className="form__section-title">컨텍스트 유지</p>
+            <p className="form__section-title">대화 유지</p>
           </div>
           <div className="account__switch">
             <Switch
               checked={keepContext}
-              label={`${account.label} 컨텍스트 유지`}
+              label={`${account.label} 대화 유지`}
               disabled={busy}
               onChange={setKeepContext}
             />
-            <span aria-hidden="true">{keepContext ? "유지" : "작업마다 새 스레드"}</span>
+            <span aria-hidden="true">{keepContext ? "대화 유지" : account.provider === "muse" ? "사이드 챗 삭제" : "작업마다 새 대화"}</span>
           </div>
           <p className="quiet">{keepContextNote}</p>
         </div>

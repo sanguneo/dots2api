@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { GatewayError } from "../contracts";
 import type { AdapterContext, CheckResult, Credentials, ProviderAdapter, RunImage, RunResult } from "../contracts";
-import { createMuseAdapter as createBrowserAdapter, pruneThreadsFromEnvironment, sanitizeDiagnostics } from "./muse/engine";
+import { createMuseAdapter as createBrowserAdapter, sanitizeDiagnostics } from "./muse/engine";
 
 const MAX_ATTEMPTS = 2;
 const WORKER_LOG_LIMIT = 256 * 1024;
@@ -162,9 +162,9 @@ async function callWorker(
   }
 }
 
-export function createMuseAdapter(site = "https://muse.ai", chatTimeout = 300_000, pruneThreads = pruneThreadsFromEnvironment()): ProviderAdapter {
+export function createMuseAdapter(site = "https://muse.ai", chatTimeout = 300_000): ProviderAdapter {
   const definition = createBrowserAdapter(site, chatTimeout);
-  const settings: WorkerSettings = { site, chatTimeout, pruneThreads };
+  const settings: WorkerSettings = { site, chatTimeout, pruneThreads: false };
   /** Re-verifies the account's session: the same work the console's Check button performs. */
   const reconnect = async (credentials: Credentials, context: AdapterContext): Promise<CheckResult> => {
     definition.validate(credentials);
@@ -172,9 +172,11 @@ export function createMuseAdapter(site = "https://muse.ai", chatTimeout = 300_00
     if (result.type !== "checked") throw new GatewayError("muse_worker", "Unexpected Muse check result.", 502);
     return { detail: result.detail };
   };
-  /** Muse starts a thread per job anyway; the account switch decides whether the side chat it leaves is kept. */
-  const runSettings = (context: AdapterContext): WorkerSettings =>
-    context.keepContext === false && !settings.pruneThreads ? { ...settings, pruneThreads: true } : settings;
+  /**
+   * Muse starts a thread per job anyway, so the account's context switch alone decides whether the side chat it leaves
+   * is deleted: on keeps it, off deletes it. Deletion cannot be undone, so nothing else may turn it on behind the switch.
+   */
+  const runSettings = (context: AdapterContext): WorkerSettings => ({ ...settings, pruneThreads: context.keepContext === false });
   const runOnce = async (credentials: Credentials, prompt: string, context: AdapterContext): Promise<RunResult> => {
     const result = await callWorker("run", runSettings(context), credentials, prompt, context);
     if (result.type !== "completed") throw new GatewayError("muse_worker", "Unexpected Muse job result.", 502, true);

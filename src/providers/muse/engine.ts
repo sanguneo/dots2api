@@ -222,14 +222,10 @@ async function mediaBytesInPage(src: string): Promise<{ readonly ok: boolean; re
 }
 
 /**
- * Every job opens /thread/new, which Muse keeps as a persistent side chat titled after the prompt. When the operator
- * opts in, the side chat this job just finished is deleted through Muse's own UI (⋯ → Delete → confirm). Deletion
- * cannot be undone, so it is off by default and only touches the single row Muse marks as the open thread.
+ * Every job opens /thread/new, which Muse keeps as a persistent side chat titled after the prompt. When the account's
+ * context switch is off, the side chat this job just finished is deleted through Muse's own UI (⋯ → Delete → confirm).
+ * Deletion cannot be undone, so it only touches the single row Muse marks as the open thread.
  */
-export function pruneThreadsFromEnvironment(): boolean {
-  return process.env["DOTS2API_MUSE_PRUNE_THREADS"] === "1";
-}
-
 const PRUNE_STEP_TIMEOUT = 5_000;
 
 /** Deletes the side chat open on this page; false when it is not exactly one marked row or any step fails. */

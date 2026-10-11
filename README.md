@@ -26,7 +26,7 @@
 
 - **OpenAI-style chat.** `POST /v1/chat/completions` with `dots-agent`; `tools` and `tool_choice` work through a prompt-based JSON bridge, and the returned calls are executed by your client (for example OmO).
 - **Image generation.** `POST /v1/images/generations` with `dots-image` or `muse-image` takes `prompt`, `n` (1–4), `size`, `quality` and `response_format` (`b64_json` or `url`); files are accepted as PNG, JPEG or WebP, judged by file signature and capped at 32 MiB each. `dots-image` runs on a Dot; `muse-image` generates through your own muse.ai account in an isolated Chrome profile (needs Node.js 22 or newer and Chromium) and usually returns WebP.
-- **Provider and account switches.** Every account has its own enable switch, and each provider (Dots, Muse) has a master switch that stops new jobs from routing to it without touching stored credentials.
+- **Provider and account switches.** Every account has its own enable switch, and each provider (Dots, Muse) has a master switch that stops new jobs from routing to it without touching stored credentials. Each account also has a **keep context** switch, on by default: on, a Dots account keeps working in one thread; off, every job runs in a fresh thread that is archived afterwards, so one job's prompts and images never carry into the next.
 - **Self-healing.** A Dots account whose thread lost its agent rebinds to a fresh thread on its own; a Muse account whose session expired or whose cloud workspace VM slept renews the session and wakes the VM before running, so it recovers after a remote reset or a server reboot. When a job ends unconfirmed, the gateway re-checks that account's session before taking it out of rotation and keeps it usable if the check passes; a Muse job is retried once only after such a re-check, and the job text says so (the first attempt may still finish on Muse).
 - **Web console.** A React console on loopback with accounts, jobs, a job drawer with image preview, and an API guide that shows your local API key and an OmO `models.json` example.
 - **Device-code login.** You approve at `auth.openai.com/codex/device`, possibly from another computer; tokens stay on the server, encrypted with AES-256-GCM, and are refreshed 60 seconds before expiry.
@@ -97,7 +97,7 @@ Muse has no official OAuth app, so a Muse account is connected by signing into m
 
 Either way the renewed session cookies are written back to the account, and the Muse self-heal renews the session and wakes the workspace VM before every job.
 
-Every `muse-image` job opens a new Muse thread, which the Muse app keeps as a side chat titled after the prompt. Set `DOTS2API_MUSE_PRUNE_THREADS=1` in the service environment to delete that side chat after a job succeeds. Deletion cannot be undone, so it is off by default; it only deletes the one row Muse marks as the open thread, and a failed or uncertain job leaves its side chat in place.
+Every `muse-image` job opens a new Muse thread, which the Muse app keeps as a side chat titled after the prompt. Turn the account's **keep context** switch off in the console to delete that side chat after a job succeeds. Deletion cannot be undone, so it is on (keep) by default; it only deletes the one row Muse marks as the open thread, and a failed or uncertain job leaves its side chat in place. The switch alone decides this: the old `DOTS2API_MUSE_PRUNE_THREADS` environment variable is no longer read.
 
 ### Chat
 
