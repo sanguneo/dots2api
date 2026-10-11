@@ -172,8 +172,11 @@ export function createMuseAdapter(site = "https://muse.ai", chatTimeout = 300_00
     if (result.type !== "checked") throw new GatewayError("muse_worker", "Unexpected Muse check result.", 502);
     return { detail: result.detail };
   };
+  /** Muse starts a thread per job anyway; the account switch decides whether the side chat it leaves is kept. */
+  const runSettings = (context: AdapterContext): WorkerSettings =>
+    context.keepContext === false && !settings.pruneThreads ? { ...settings, pruneThreads: true } : settings;
   const runOnce = async (credentials: Credentials, prompt: string, context: AdapterContext): Promise<RunResult> => {
-    const result = await callWorker("run", settings, credentials, prompt, context);
+    const result = await callWorker("run", runSettings(context), credentials, prompt, context);
     if (result.type !== "completed") throw new GatewayError("muse_worker", "Unexpected Muse job result.", 502, true);
     const images: RunImage[] = result.images.map((image) => ({
       mime: image.mime,

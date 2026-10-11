@@ -34,6 +34,7 @@ const accountSchema = z.object({
   provider: providerIdSchema,
   label: z.string(),
   enabled: z.boolean(),
+  keepContext: z.boolean(),
   status: z.enum(["unconnected", "ready", "error"]),
   detail: z.string(),
   createdAt: z.string(),
@@ -74,6 +75,7 @@ export interface AccountInput {
 export interface AccountPatch {
   readonly label?: string;
   readonly enabled?: boolean;
+  readonly keepContext?: boolean;
   readonly credentials?: Readonly<Record<string, string>>;
 }
 

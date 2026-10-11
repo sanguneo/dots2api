@@ -90,3 +90,17 @@ test("reads accounts saved with split chat and image flags as a single enabled f
   cleanups.push(() => store.close());
   expect(ids.map((id) => store.account(id as never)?.enabled)).toEqual([false, true]);
 });
+
+test("reads an account saved before the context switch as keeping context", () => {
+  const dir = mkdtempSync(join(tmpdir(), "dots2api-migrate-"));
+  cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+  const seed = new Store(dir);
+  const id = seed.createAccount("dots", "legacy-context", {}).id;
+  const row = seed.db.query<{ body: string }, [string]>("SELECT body FROM accounts WHERE id=?").get(id);
+  const { keepContext: _keepContext, ...rest } = JSON.parse(row?.body ?? "{}");
+  seed.db.query("UPDATE accounts SET body=? WHERE id=?").run(JSON.stringify(rest), id);
+  seed.close();
+  const store = new Store(dir);
+  cleanups.push(() => store.close());
+  expect(store.account(id as never)?.keepContext).toBe(true);
+});

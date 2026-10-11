@@ -871,6 +871,33 @@ describe("account isolation and job state", () => {
     });
   });
 
+  describe("account context switch", () => {
+    const jsonHeaders = { "sec-fetch-site": "same-origin", "content-type": "application/json" };
+    const patchAccount = (app: ReturnType<typeof fixture>["app"], id: string, body: unknown) =>
+      app.request(`http://localhost/api/accounts/${id}`, { method: "PATCH", headers: jsonHeaders, body: JSON.stringify(body) });
+    const accounts = async (app: ReturnType<typeof fixture>["app"]): Promise<{ id: string; keepContext: boolean }[]> =>
+      (await (await app.request("http://localhost/api/accounts", { headers: { "sec-fetch-site": "same-origin" } })).json()).accounts;
+
+    test("keeps context by default and follows the console switch", async () => {
+      // Given a freshly connected account, the console reads the switch as on.
+      const { app, gateway } = fixture();
+      const id = gateway.create("dots", "Switch", {}).id;
+      expect((await accounts(app)).find((account) => account.id === id)?.keepContext).toBe(true);
+      // When the operator switches it off.
+      const response = await patchAccount(app, id, { keepContext: false });
+      // Then the account is saved off and the listing reflects it.
+      expect(response.status).toBe(200);
+      expect((await response.json()).account.keepContext).toBe(false);
+      expect((await accounts(app)).find((account) => account.id === id)?.keepContext).toBe(false);
+    });
+
+    test("rejects a context switch that is not a boolean", async () => {
+      const { app, gateway } = fixture();
+      const id = gateway.create("dots", "Switch", {}).id;
+      expect((await patchAccount(app, id, { keepContext: "off" })).status).toBe(400);
+    });
+  });
+
   describe("job images", () => {
     const png = Uint8Array.from(Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==", "base64"));
     const submit = async (app: ReturnType<typeof fixture>["app"], key: string) => {

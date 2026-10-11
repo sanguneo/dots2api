@@ -27,10 +27,15 @@ interface AccountRowProps {
 function AccountRow({ account, provider, contextWindow, contextBasis, checkStartedAt, now }: AccountRowProps) {
   const { openEditAccount, requestDeleteAccount } = useConsoleActions();
   const [toggling, setToggling] = useState(false);
+  const [togglingKeep, setTogglingKeep] = useState(false);
   const [loginOpen, setLoginOpen] = useState(false);
   const titleId = useId();
   const checking = checkStartedAt !== undefined;
   const lockedByServer = account.busy && !checking;
+  const keepContextNote =
+    account.provider === "muse"
+      ? "Muse는 작업마다 새 스레드를 엽니다. 끄면 작업이 남기는 사이드 챗을 정리합니다."
+      : "켜면 계정의 스레드 하나를 계속 쓰고 이미지 예산을 넘으면 교체합니다. 끄면 작업마다 새 스레드를 열고 끝나면 아카이브합니다.";
 
   async function toggle(enabled: boolean): Promise<void> {
     setToggling(true);
@@ -40,6 +45,17 @@ function AccountRow({ account, provider, contextWindow, contextBasis, checkStart
       notify("danger", `‘${account.label}’ ${enabled ? "활성화" : "비활성화"}하지 못했습니다`, (await toApiError(error)).message);
     } finally {
       setToggling(false);
+    }
+  }
+
+  async function toggleKeep(keepContext: boolean): Promise<void> {
+    setTogglingKeep(true);
+    try {
+      await gateway.updateAccount(account.id, { keepContext });
+    } catch (error) {
+      notify("danger", `‘${account.label}’ 컨텍스트 설정을 바꾸지 못했습니다`, (await toApiError(error)).message);
+    } finally {
+      setTogglingKeep(false);
     }
   }
 
@@ -69,6 +85,7 @@ function AccountRow({ account, provider, contextWindow, contextBasis, checkStart
           {account.hasCredentials ? null : <span>저장된 자격 증명 없음</span>}
         </p>
         {account.detail ? <p className="account__detail">{account.detail}</p> : null}
+        <p className="account__detail">{keepContextNote}</p>
         {checking ? (
           <p className="account__progress" role="status">
             <LogIn aria-hidden="true" />
@@ -106,6 +123,17 @@ function AccountRow({ account, provider, contextWindow, contextBasis, checkStart
             onChange={(enabled) => void toggle(enabled)}
           />
           <span aria-hidden="true">{account.enabled ? "활성" : "비활성"}</span>
+        </div>
+        <div className="account__switch">
+          <Switch
+            checked={account.keepContext}
+            label={`${account.label} 컨텍스트 유지`}
+            loading={togglingKeep}
+            disabled={account.busy}
+            title={account.busy ? BUSY_TITLE : undefined}
+            onChange={(keepContext) => void toggleKeep(keepContext)}
+          />
+          <span aria-hidden="true">{account.keepContext ? "유지" : "작업마다 새 스레드"}</span>
         </div>
         <div className="account__actions">
           <Button size="sm" icon={<LogIn aria-hidden="true" />} disabled={account.busy} onClick={() => setLoginOpen(true)}>

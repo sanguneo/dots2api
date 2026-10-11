@@ -713,3 +713,131 @@ test("run keeps using a thread this gateway created itself", async () => {
   });
   expect(methods).not.toContain("thread/start");
 });
+test("check rebinds a Dot thread that can never accept a turn again", async () => {
+  // Given a stored thread whose agent is gone, the state a Dot that moved to the new backend leaves behind.
+  const methods: string[] = [];
+  const saved: Credentials[] = [];
+  await withServer((peer, request) => {
+    methods.push(request.method);
+    if (request.method === "initialize") { reply(peer, request, { userAgent: "test" }); return; }
+    if (request.method === "initialized") return;
+    if (request.method === "thread/read" || request.method === "thread/resume") {
+      reply(peer, request, { thread: { id: "dot-thread", threadSource: "aeon", modelProvider: "", canAcceptDirectInput: false } });
+      return;
+    }
+    if (request.method === "thread/start") { reply(peer, request, { thread: { id: "healed-thread" } }); return; }
+    if (request.method === "thread/archive") { reply(peer, request, {}); return; }
+  }, async (credentials) => {
+    // When the console checks the account.
+    const result = await dotsAdapter.check(credentials, { ...context, saveCredentials: (repaired) => { saved.push(repaired); } });
+    // Then the check repairs the account instead of reporting a thread that can never work again.
+    expect(result.detail).toContain("replacement");
+  });
+  // Then the replacement is stored for later jobs, and the operator's own thread is left untouched.
+  expect(methods).toEqual(["initialize", "initialized", "thread/read", "thread/start"]);
+  expect(saved).toHaveLength(1);
+  expect(saved[0]).toMatchObject({ threadId: "healed-thread", threadOrigin: "self", threadImageBytes: "0" });
+});
+
+test("check archives the thread it replaces when the gateway created it", async () => {
+  const methods: string[] = [];
+  await withServer((peer, request) => {
+    methods.push(request.method);
+    if (request.method === "initialize") { reply(peer, request, { userAgent: "test" }); return; }
+    if (request.method === "initialized") return;
+    if (request.method === "thread/read") {
+      reply(peer, request, { thread: { id: "dot-thread", threadSource: null, modelProvider: "", canAcceptDirectInput: false } });
+      return;
+    }
+    if (request.method === "thread/start") { reply(peer, request, { thread: { id: "healed-thread" } }); return; }
+    if (request.method === "thread/archive") {
+      expect(request.params.threadId).toBe("dot-thread");
+      reply(peer, request, {});
+      return;
+    }
+  }, async (credentials) => {
+    await dotsAdapter.check({ ...credentials, threadOrigin: "self" }, { ...context, saveCredentials: () => {} });
+  });
+  expect(methods).toContain("thread/archive");
+});
+
+test("check without a credential store reports the missing agent instead of rebinding", async () => {
+  await withServer((peer, request) => {
+    if (request.method === "initialize") { reply(peer, request, { userAgent: "test" }); return; }
+    if (request.method === "initialized") return;
+    if (request.method === "thread/read") {
+      reply(peer, request, { thread: { id: "dot-thread", threadSource: "aeon", modelProvider: "", canAcceptDirectInput: false } });
+    }
+  }, async (credentials) => {
+    const failure = await dotsAdapter.check(credentials, context).catch((error: unknown) => error);
+    expect(failure).toMatchObject({ code: "dots_thread_missing", status: 502 });
+  });
+});
+
+test("run with context switched off opens a thread per job and retires it", async () => {
+  const methods: string[] = [];
+  const saved: Credentials[] = [];
+  await withServer((peer, request) => {
+    methods.push(request.method);
+    if (request.method === "initialize") { reply(peer, request, { userAgent: "test" }); return; }
+    if (request.method === "initialized") return;
+    if (request.method === "thread/start") { reply(peer, request, { thread: { id: "job-thread" } }); return; }
+    if (request.method === "thread/archive") {
+      expect(request.params.threadId).toBe("job-thread");
+      reply(peer, request, {});
+      return;
+    }
+    if (request.method !== "turn/start") return;
+    expect(request.params.threadId).toBe("job-thread");
+    expect(request.params.input).toEqual([{ type: "text", text: "Hello Dot" }]);
+    peer.send(JSON.stringify({ method: "turn/completed", params: {
+      threadId: "job-thread", turn: { id: "turn-7", status: "completed", items: [{ id: "answer", type: "agentMessage", text: "Fresh" }] },
+    } }));
+    reply(peer, request, { turn: { id: "turn-7", status: "inProgress" } });
+  }, async (credentials) => {
+    const result = await dotsAdapter.run(credentials, "Hello Dot", { ...context, keepContext: false, saveCredentials: (repaired) => { saved.push(repaired); } });
+    expect(result).toEqual({ text: "Fresh", remoteId: "turn-7" });
+  });
+  // Then the account's stored thread is neither read nor written, and the job's own thread is archived.
+  expect(methods).toEqual(["initialize", "initialized", "thread/start", "turn/start", "thread/archive"]);
+  expect(saved).toEqual([]);
+});
+
+test("a fresh-thread job archives its thread after a failed turn", async () => {
+  const methods: string[] = [];
+  await withServer((peer, request) => {
+    methods.push(request.method);
+    if (request.method === "initialize") { reply(peer, request, { userAgent: "test" }); return; }
+    if (request.method === "initialized") return;
+    if (request.method === "thread/start") { reply(peer, request, { thread: { id: "job-thread" } }); return; }
+    if (request.method === "thread/archive") { reply(peer, request, {}); return; }
+    if (request.method !== "turn/start") return;
+    peer.send(JSON.stringify({ method: "turn/completed", params: {
+      threadId: "job-thread", turn: { id: "turn-8", status: "failed", items: [] },
+    } }));
+    reply(peer, request, { turn: { id: "turn-8", status: "inProgress" } });
+  }, async (credentials) => {
+    const failure = await dotsAdapter.run(credentials, "Hello Dot", { ...context, keepContext: false, saveCredentials: () => {} })
+      .catch((error: unknown) => error);
+    expect(failure).toMatchObject({ code: "dots_turn", uncertain: false });
+  });
+  expect(methods).toContain("thread/archive");
+});
+
+test("a fresh-thread job leaves an uncertain turn's thread alone", async () => {
+  const methods: string[] = [];
+  await withServer((peer, request) => {
+    methods.push(request.method);
+    if (request.method === "initialize") { reply(peer, request, { userAgent: "test" }); return; }
+    if (request.method === "initialized") return;
+    if (request.method === "thread/start") { reply(peer, request, { thread: { id: "job-thread" } }); return; }
+    if (request.method === "thread/archive") { reply(peer, request, {}); return; }
+    // A submission Dot never confirmed: it may still be running remotely.
+    if (request.method === "turn/start") reply(peer, request, {});
+  }, async (credentials) => {
+    const failure = await dotsAdapter.run(credentials, "Hello Dot", { ...context, keepContext: false, saveCredentials: () => {} })
+      .catch((error: unknown) => error);
+    expect(failure).toMatchObject({ code: "dots_protocol", uncertain: true });
+  });
+  expect(methods).not.toContain("thread/archive");
+});

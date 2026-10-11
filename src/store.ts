@@ -15,6 +15,8 @@ const accountSchema = z.preprocess((raw) => {
   provider: providerIdSchema,
   label: z.string(),
   enabled: z.boolean(),
+  // Added after the first release: an account stored without it keeps one thread across jobs, as it always did.
+  keepContext: z.boolean().default(true),
   status: z.enum(["unconnected", "ready", "error"]),
   detail: z.string(),
   createdAt: z.string(),
@@ -165,7 +167,7 @@ export class Store {
   }
   createAccount(provider: ProviderId, label: string, credentials: Credentials): Account {
     const account: Account = {
-      id: accountIdSchema.parse(crypto.randomUUID()), provider, label, enabled: true,
+      id: accountIdSchema.parse(crypto.randomUUID()), provider, label, enabled: true, keepContext: true,
       status: "unconnected", detail: "Connection has not been checked.",
       createdAt: new Date().toISOString(), checkedAt: null, lastUsedAt: null,
       hasCredentials: Object.keys(credentials).length > 0, busy: false,

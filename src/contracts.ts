@@ -15,6 +15,8 @@ export interface Account {
   readonly provider: ProviderId;
   readonly label: string;
   readonly enabled: boolean;
+  /** Keep one conversation thread across jobs. Off: every job runs on a fresh thread of its own. */
+  readonly keepContext: boolean;
   readonly status: AccountStatus;
   readonly detail: string;
   readonly createdAt: string;
@@ -95,6 +97,8 @@ export interface RunResult {
 }
 export interface AdapterContext {
   readonly accountId: AccountId;
+  /** False when every job must run on its own fresh thread; absent reads as "keep one thread". */
+  readonly keepContext?: boolean;
   readonly dataDir: string;
   readonly signal: AbortSignal;
   readonly referenceImages?: readonly ReferenceImage[];

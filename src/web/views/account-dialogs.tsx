@@ -4,7 +4,7 @@ import { ChevronRight, ExternalLink, PlugZap } from "lucide-react";
 import type { Account, CredentialField, ProviderId } from "../../contracts";
 import { ConfirmDialog, Drawer } from "../components/dialog";
 import { LoadError } from "../components/domain";
-import { Button, Field, Notice, SecretArea, SecretInput, SkeletonRows } from "../components/ui";
+import { Button, Field, Notice, SecretArea, SecretInput, SkeletonRows, Switch } from "../components/ui";
 import type { NoticeTone } from "../components/ui";
 import { runCheck } from "../lib/actions";
 import { toApiError } from "../lib/api";
@@ -94,6 +94,7 @@ export function AccountDrawer({ account, onClose }: { readonly account: Account;
   const formId = useId();
   const formRef = useRef<HTMLFormElement>(null);
   const [label, setLabel] = useState(account.label);
+  const [keepContext, setKeepContext] = useState(account.keepContext);
   const [values, setValues] = useState<TextMap>({});
   const [labelError, setLabelError] = useState<string | null>(null);
   const [message, setMessage] = useState<{ readonly tone: NoticeTone; readonly text: string } | null>(null);
@@ -104,6 +105,10 @@ export function AccountDrawer({ account, onClose }: { readonly account: Account;
   const gone = accounts.data !== null && current === null;
   const busy = current?.busy ?? false;
   const blocked = saving !== null || provider === null || gone || busy;
+  const keepContextNote =
+    account.provider === "muse"
+      ? "Muse는 작업마다 새 스레드를 엽니다. 끄면 작업이 남기는 사이드 챗을 정리합니다."
+      : "켜면 계정의 스레드 하나를 계속 쓰고 이미지 예산을 넘으면 교체합니다. 끄면 작업마다 새 스레드를 열고 끝나면 아카이브합니다.";
 
   async function save(mode: SaveMode): Promise<void> {
     if (blocked || provider === null) return;
@@ -121,18 +126,20 @@ export function AccountDrawer({ account, onClose }: { readonly account: Account;
     }
     const changedLabel = trimmedLabel !== account.label;
     const changedCredentials = Object.keys(credentials).length > 0;
+    const changedKeepContext = keepContext !== account.keepContext;
     setMessage(null);
-    if (!changedLabel && !changedCredentials && mode === "save") {
+    if (!changedLabel && !changedCredentials && !changedKeepContext && mode === "save") {
       setMessage({ tone: "info", text: "변경된 내용이 없습니다." });
       return;
     }
     setSaving(mode);
     try {
       let saved: Account = current ?? account;
-      if (changedLabel || changedCredentials) {
+      if (changedLabel || changedCredentials || changedKeepContext) {
         saved = await gateway.updateAccount(account.id, {
           ...(changedLabel ? { label: trimmedLabel } : {}),
           ...(changedCredentials ? { credentials } : {}),
+          ...(changedKeepContext ? { keepContext } : {}),
         });
         notify(
           "ok",
@@ -207,6 +214,22 @@ export function AccountDrawer({ account, onClose }: { readonly account: Account;
               />
             )}
           </Field>
+        </div>
+
+        <div className="form__section">
+          <div className="form__section-head">
+            <p className="form__section-title">컨텍스트 유지</p>
+          </div>
+          <div className="account__switch">
+            <Switch
+              checked={keepContext}
+              label={`${account.label} 컨텍스트 유지`}
+              disabled={busy}
+              onChange={setKeepContext}
+            />
+            <span aria-hidden="true">{keepContext ? "유지" : "작업마다 새 스레드"}</span>
+          </div>
+          <p className="quiet">{keepContextNote}</p>
         </div>
 
         <Notice title="다시 로그인하려면">

@@ -101,7 +101,7 @@ export class Gateway {
     this.changed();
     return account;
   }
-  update(id: AccountId, patch: { readonly label?: string; readonly enabled?: boolean; readonly credentials?: Credentials }): Account {
+  update(id: AccountId, patch: { readonly label?: string; readonly enabled?: boolean; readonly keepContext?: boolean; readonly credentials?: Credentials }): Account {
     const account = this.account(id);
     if (account.busy) throw new GatewayError("account_busy", "Wait for the account's current operation.", 409);
     const previous = { ...this.store.credentials(id) };
@@ -118,6 +118,7 @@ export class Gateway {
     }
     const updated = this.store.saveAccount({
       ...account, label: patch.label ?? account.label, enabled: patch.enabled ?? account.enabled,
+      keepContext: patch.keepContext ?? account.keepContext,
       ...(patch.credentials ? { status: "unconnected", detail: "Credentials changed. Check connection again.", checkedAt: null } as const : {}),
     }, patch.credentials ? { ...previous, ...patch.credentials } : undefined);
     this.changed();
@@ -143,7 +144,7 @@ export class Gateway {
       const signal = AbortSignal.any([this.shutdown.signal, AbortSignal.timeout(300_000)]);
       const credentials = adapter.validate(await this.credentials(id, signal));
       const result = await adapter.check(credentials, {
-        accountId: id, dataDir: this.store.dataDir, signal,
+        accountId: id, dataDir: this.store.dataDir, signal, keepContext: account.keepContext,
         // A check may repair credentials (for example a renewed browser session); persist them without touching status.
         saveCredentials: (repaired) => { this.store.saveAccount(this.account(id), repaired); },
       });
@@ -170,7 +171,7 @@ export class Gateway {
       const signal = AbortSignal.any([this.shutdown.signal, AbortSignal.timeout(300_000)]);
       const credentials = adapter.validate(await this.credentials(id, signal));
       const result = await adapter.reconnect(credentials, {
-        accountId: id, dataDir: this.store.dataDir, signal,
+        accountId: id, dataDir: this.store.dataDir, signal, keepContext: this.account(id).keepContext,
         saveCredentials: (repaired) => { this.store.saveAccount(this.account(id), repaired); },
       });
       return this.store.saveAccount({
@@ -275,6 +276,7 @@ export class Gateway {
       const credentials = this.adapters[job.provider].validate(await this.credentials(job.accountId, signal));
       const result = await this.adapters[job.provider].run(credentials, job.prompt, {
         accountId: job.accountId, dataDir: this.store.dataDir, signal,
+        keepContext: this.store.account(job.accountId)?.keepContext ?? true,
         ...(referenceImages ? { referenceImages } : {}),
         saveCredentials: (repaired) => { this.store.saveAccount(this.account(job.accountId), repaired); },
         onAccepted: (id) => {

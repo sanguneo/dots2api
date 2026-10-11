@@ -264,9 +264,34 @@ async function provisionThread(
 async function sessionCheck(credentials: Credentials, context: AdapterContext): Promise<CheckResult> {
   const settings = config(credentials);
   return withConnection(settings, context, async (connection) => {
-    await existingThread(connection, settings.threadId, credentials["threadOrigin"] === "self");
-    return { detail: "Existing thread reports Aeon Dot identity; live compatibility and quota remain unverified." };
+    try {
+      await existingThread(connection, settings.threadId, credentials["threadOrigin"] === "self");
+      return { detail: "Existing thread reports Aeon Dot identity; live compatibility and quota remain unverified." };
+    } catch (error) {
+      // A Dot that has moved to the new backend keeps its thread record but can never accept a turn again. run rebinds
+      // such a thread; a check that only reports the failure would end a fresh device login in error and keep submit
+      // from ever reaching run. provisionThread archives only a thread this gateway created, never the operator's.
+      if (!(error instanceof GatewayError) || !REBINDABLE.has(error.code) || !context.saveCredentials) throw error;
+      await provisionThread(connection, context.saveCredentials, credentials);
+      return { detail: "The stored thread cannot accept input, so a replacement thread was created for this account." };
+    }
   });
+}
+
+/** Opens a thread that belongs to one job; nothing is stored, so an account switched back on keeps the thread it had. */
+async function openThread(connection: DotConnection): Promise<string> {
+  const created = createdThreadSchema.safeParse(await connection.request("thread/start", {}));
+  if (!created.success) throw new GatewayError("dots_thread", "Dot did not create a thread for this job.", 502);
+  return created.data.thread.id;
+}
+
+/** Housekeeping for a job-owned thread: one left behind is untidy, never a reason to fail a job that produced an answer. */
+async function archiveThread(connection: DotConnection, threadId: string): Promise<void> {
+  try {
+    await connection.request("thread/archive", { threadId });
+  } catch {
+    // Ignored on purpose, as in archiveReplacedThread.
+  }
 }
 
 /** Waits for one submitted turn and assembles its answer; a turn Dot did not complete is reported with its reason. */
@@ -357,6 +382,24 @@ export const dotsAdapter: ProviderAdapter = {
     const settings = config(credentials);
     if (!prompt.trim()) throw new GatewayError("dots_prompt", "Prompt must not be empty.");
     return withConnection(settings, context, async (connection, submission) => {
+      if (context.keepContext === false) {
+        // The operator keeps no context on this account: the job gets a thread of its own, which is retired afterwards.
+        const ownThread = await openThread(connection);
+        try {
+          submission.mark();
+          const started = await startTurn(connection, ownThread, prompt, context.referenceImages);
+          const turnId = started.turn.id;
+          context.onAccepted?.(turnId);
+          const result = await collectTurn(connection, ownThread, turnId);
+          await archiveThread(connection, ownThread);
+          return result;
+        } catch (error) {
+          // An uncertain turn may still be running remotely, and archiving it would discard work still producing an
+          // answer; a turn that definitely failed leaves a thread nobody will ever use again.
+          if (error instanceof GatewayError && !error.uncertain) await archiveThread(connection, ownThread);
+          throw error;
+        }
+      }
       // The selected thread is a consumer Dot and keeps its identity gate; a replacement is trusted by creation.
       let threadId = settings.threadId;
       let rotated = false;
