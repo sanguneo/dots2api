@@ -11,7 +11,7 @@ import { Store } from "../src/store";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const cleanup of cleanups.splice(0).reverse()) cleanup(); });
-function fixture(run: ProviderAdapter["run"] = async () => ({ text: "fixture result", remoteId: "remote-1" }), reconnect?: ProviderAdapter["reconnect"]) {
+function fixture(run: ProviderAdapter["run"] = async () => ({ text: "fixture result", remoteId: "remote-1" }), reconnect?: ProviderAdapter["reconnect"], queueBytes?: number) {
   const dir = mkdtempSync(join(tmpdir(), "dots2api-test-"));
   const store = new Store(dir);
   cleanups.push(() => { store.close(); rmSync(dir, { recursive: true, force: true }); });
@@ -26,7 +26,7 @@ function fixture(run: ProviderAdapter["run"] = async () => ({ text: "fixture res
       ...(reconnect ? { reconnect } : {}),
     };
   }
-  const gateway = new Gateway(store, { dots: adapter("dots"), muse: adapter("muse") });
+  const gateway = new Gateway(store, { dots: adapter("dots"), muse: adapter("muse") }, undefined, queueBytes);
   return { dir, store, gateway, app: createApi(gateway) };
 }
 
@@ -95,6 +95,137 @@ describe("account storage", () => {
 });
 
 describe("account isolation and job state", () => {
+  test("acquires job ownership before a competing login can reserve the account", async () => {
+    // Given a ready account with a submitted job whose start is scheduled.
+    const started = Promise.withResolvers<void>();
+    const finish = Promise.withResolvers<void>();
+    const { gateway } = fixture(async () => {
+      started.resolve();
+      await finish.promise;
+      return { text: "done", remoteId: "remote" };
+    });
+    const account = gateway.create("dots", "Ownership", {});
+    await gateway.check(account.id);
+    const job = gateway.submit({ accountId: account.id, prompt: "work" });
+    // When a login races the continuation after acquisition.
+    await Promise.resolve();
+    try {
+      expect(() => gateway.reserve(account.id)).toThrow(GatewayError);
+      await started.promise;
+      // Then the account remains owned by the running job.
+      expect(gateway.account(account.id).busy).toBe(true);
+    } finally { finish.resolve(); await gateway.wait(job.id); }
+  });
+
+  test("drains every accepted queued job before returning and refuses new work", async () => {
+    // Given one controlled run and nineteen accepted waiting jobs.
+    const started = Promise.withResolvers<void>();
+    const finish = Promise.withResolvers<void>();
+    let runs = 0;
+    const { gateway, store } = fixture(async () => {
+      runs++;
+      started.resolve();
+      await finish.promise;
+      return { text: "done", remoteId: "remote" };
+    });
+    const account = gateway.create("dots", "Drain", {});
+    await gateway.check(account.id);
+    const first = gateway.submit({ accountId: account.id, prompt: "first" });
+    await started.promise;
+    const waiting = Array.from({ length: 19 }, () => gateway.submit({ accountId: account.id, prompt: "queued" }));
+    // When shutdown begins and the active run completes.
+    gateway.stop();
+    expect(() => gateway.submit({ accountId: account.id, prompt: "late" })).toThrow(GatewayError);
+    finish.resolve();
+    await gateway.drain();
+    // Then all accepted jobs are terminal and no queued work reached the provider.
+    expect([first, ...waiting].map((job) => store.job(job.id)?.status)).toEqual(["completed", ...waiting.map(() => "failed" as const)]);
+    expect(runs).toBe(1);
+  });
+
+  test("routes to spare capacity before scheduled jobs have marked accounts busy", async () => {
+    // Given a full first account and a second account with one pending job.
+    const finish = Promise.withResolvers<void>();
+    const { gateway } = fixture(async () => {
+      await finish.promise;
+      return { text: "done", remoteId: "remote" };
+    });
+    const a = gateway.create("dots", "A", {});
+    const b = gateway.create("dots", "B", {});
+    await gateway.check(a.id); await gateway.check(b.id);
+    const jobs = Array.from({ length: 20 }, () => gateway.submit({ accountId: a.id, prompt: "full" }));
+    jobs.push(gateway.submit({ accountId: b.id, prompt: "one" }));
+    // When automatic routing runs in the same synchronous submission burst.
+    try {
+      const next = gateway.submit({ provider: "dots", prompt: "automatic" });
+      jobs.push(next);
+      // Then the full account cannot conceal the second account's capacity.
+      expect(next.accountId).toBe(b.id);
+    } finally { finish.resolve(); await Promise.all(jobs.map((job) => gateway.wait(job.id))); }
+  });
+
+  test("rejects retained bytes before persistence and releases reservations on completion", async () => {
+    // Given a deliberately small quota and a held run that exactly fills it.
+    const finish = Promise.withResolvers<void>();
+    const { gateway, store } = fixture(async () => {
+      await finish.promise;
+      return { text: "done", remoteId: null };
+    }, undefined, 8);
+    const account = gateway.create("dots", "Budget", {});
+    await gateway.check(account.id);
+    const first = gateway.submit({ accountId: account.id, prompt: "four" });
+    // When another request exceeds the retained UTF-16 input quota.
+    try {
+      expect(() => gateway.submit({ accountId: account.id, prompt: "x" })).toThrow(GatewayError);
+      // Then rejection left no partial record or capacity allocation.
+      expect(store.jobs()).toHaveLength(1);
+    } finally { finish.resolve(); await gateway.wait(first.id); }
+    const next = gateway.submit({ accountId: account.id, prompt: "four" });
+    expect((await gateway.wait(next.id)).status).toBe("completed");
+  });
+
+  test("returns byte reservations when queued work is abandoned by shutdown", async () => {
+    // Given two jobs filling a controlled quota.
+    const started = Promise.withResolvers<void>();
+    const finish = Promise.withResolvers<void>();
+    const { gateway } = fixture(async () => {
+      started.resolve(); await finish.promise;
+      return { text: "done", remoteId: null };
+    }, undefined, 8);
+    const account = gateway.create("dots", "Budget stop", {});
+    await gateway.check(account.id);
+    gateway.submit({ accountId: account.id, prompt: "aa" });
+    await started.promise;
+    gateway.submit({ accountId: account.id, prompt: "bb" });
+    // When shutdown abandons the queue.
+    gateway.stop(); finish.resolve(); await gateway.drain();
+    // Then every accepted reservation was released once.
+    expect(gateway["queuedBytes"]).toBe(0);
+  });
+
+  test("rolls back interrupted recovery if account quarantine cannot be persisted", async () => {
+    // Given a running job and a SQLite fault at the quarantine write.
+    const { gateway, store, dir } = fixture();
+    const account = gateway.create("dots", "Recovery", {});
+    await gateway.check(account.id);
+    const job = store.saveJob({
+      id: jobIdSchema.parse(crypto.randomUUID()), accountId: account.id, provider: "dots",
+      prompt: "work", status: "running", output: "", error: null, remoteId: "accepted",
+      images: [], createdAt: new Date().toISOString(), finishedAt: null,
+    });
+    store.db.exec("CREATE TEMP TRIGGER fail_quarantine BEFORE UPDATE ON accounts BEGIN SELECT RAISE(ABORT, 'quarantine fault'); END");
+    // When the recovery transaction fails and is subsequently retried.
+    expect(() => store.recoverInterruptedJobs()).toThrow("quarantine fault");
+    expect(store.job(job.id)?.status).toBe("running");
+    store.db.exec("DROP TRIGGER fail_quarantine");
+    const reopened = new Store(dir);
+    try {
+      reopened.recoverInterruptedJobs();
+      // Then job uncertainty and quarantine became durable together.
+      expect(reopened.job(job.id)?.status).toBe("unknown");
+      expect(reopened.account(account.id)?.status).toBe("error");
+    } finally { reopened.close(); }
+  });
   test("shutdown aborts work and drains its persistence before releasing ownership", async () => {
     const started = Promise.withResolvers<void>();
     const aborted = Promise.withResolvers<void>();
@@ -382,7 +513,7 @@ describe("account isolation and job state", () => {
     // Given an account running on a thread this gateway created, with image content recorded on it.
     const { gateway, store } = fixture();
     const a = gateway.create("dots", "Rotated", {
-      accessToken: "secret", threadId: "gateway-thread", threadOrigin: "self", threadImageBytes: "9000000",
+      accessToken: "secret", threadId: "gateway-thread", threadOrigin: "self", threadImageBytes: "9000000", threadImageAccounting: "incomplete",
     });
     // When the operator points the account at a different thread in the console.
     gateway.update(a.id, { credentials: { threadId: "operator-thread" } });
@@ -392,6 +523,7 @@ describe("account isolation and job state", () => {
     expect(credentials["accessToken"]).toBe("secret");
     expect(credentials["threadOrigin"]).toBeUndefined();
     expect(credentials["threadImageBytes"]).toBeUndefined();
+    expect(credentials["threadImageAccounting"]).toBeUndefined();
   });
   test("re-saving the same Dot thread keeps its rotation state", () => {
     // Given an account on a gateway-created thread with a recorded image count.
@@ -787,6 +919,39 @@ describe("account isolation and job state", () => {
       expect(response.headers.get("x-dots2api-images-requested")).toBe("3");
       expect(response.headers.get("x-dots2api-images-returned")).toBe("1");
       expect(runs).toBe(2);
+    });
+
+    test("preserves the first image and its correlation ID when the next admission fails", async () => {
+      // Given a provider disabled after the first image was produced.
+      const { app, store, gateway } = fixture(async () => {
+        gateway.setProviderEnabled("dots", false);
+        return { text: "done", remoteId: "first", images: [{ mime: "image/png", data: png }] };
+      });
+      await gateway.check(gateway.create("dots", "Partial admission", {}).id);
+      // When the same HTTP request asks for two images.
+      const response = await post(app, store.apiKey, { prompt: "p", n: 2 });
+      // Then its completed image is returned even though submission two was refused.
+      expect(response.status).toBe(200);
+      expect((await response.json()).data).toHaveLength(1);
+      expect(response.headers.get("x-dots2api-images-requested")).toBe("2");
+      expect(response.headers.get("x-dots2api-images-returned")).toBe("1");
+      expect(response.headers.get("x-dots2api-job-id")).toBe(store.jobs()[0]?.id ?? null);
+    });
+
+    test("rejects unsupported explicit output encoding before remote generation", async () => {
+      // Given an image-capable provider whose output encoding cannot be controlled.
+      let runs = 0;
+      const { app, store, gateway } = fixture(async () => {
+        runs++;
+        return { text: "done", remoteId: "r", images: [{ mime: "image/webp", data: webp }] };
+      });
+      await gateway.check(gateway.create("muse", "Format", {}).id);
+      // When a client requires PNG rather than the actual provider encoding.
+      const response = await post(app, store.apiKey, { model: "muse-image", prompt: "p", output_format: "png" });
+      // Then the unsupported guarantee is rejected without consuming remote work.
+      expect(response.status).toBe(422);
+      expect(runs).toBe(0);
+      expect(store.jobs()).toHaveLength(0);
     });
 
     test.each([

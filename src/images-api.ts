@@ -81,6 +81,9 @@ export function attachImageGeneration(app: Hono, gateway: Gateway): void {
       input = fields;
     } else input = await c.req.json();
     const body = request.parse(input);
+    if (body.output_format !== undefined) {
+      throw new GatewayError("unsupported_parameter", "Explicit output_format is not supported; the provider determines the image encoding.", 422);
+    }
     const provider = imageProvider(body.model);
     const origin = new URL(c.req.url).origin;
     const prompt = buildImagePrompt({ prompt: body.prompt, size: body.size, quality: body.quality });
@@ -89,7 +92,14 @@ export function attachImageGeneration(app: Hono, gateway: Gateway): void {
     let first: { width?: number | undefined; height?: number | undefined; format?: "png" | "jpeg" | "webp" } = {};
     let failure: GatewayError | undefined;
     for (let index = 0; index < body.n; index++) {
-      const job: Job = gateway.submit({ provider, prompt, ...(referenceImages ? { referenceImages } : {}) });
+      let job: Job;
+      try {
+        job = gateway.submit({ provider, prompt, ...(referenceImages ? { referenceImages } : {}) });
+      } catch (error) {
+        if (!(error instanceof GatewayError) || data.length === 0) throw error;
+        failure = error;
+        break;
+      }
       jobIds.push(job.id);
       const result = await gateway.wait(job.id);
       if (result.status !== "completed") {

@@ -111,33 +111,35 @@ export class Store {
 
   /** Called by the serving process at startup, never by read-only diagnostics. */
   recoverInterruptedJobs(): void {
-    const unfinished = this.db.query<Row, []>("SELECT body FROM jobs WHERE json_extract(body, '$.status') IN ('queued', 'running')")
-      .all().map((row) => jobSchema.parse(JSON.parse(row.body)));
-    for (const job of unfinished) {
-      if (job.status === "queued") {
-        // Still waiting for its turn when the gateway stopped, so no remote work exists and the account stays usable.
-        this.saveJob({
-          ...job,
-          status: "failed",
-          error: "The gateway restarted before this job started; submit it again.",
-          finishedAt: new Date().toISOString(),
-        });
-        continue;
+    this.db.transaction(() => {
+      const unfinished = this.db.query<Row, []>("SELECT body FROM jobs WHERE json_extract(body, '$.status') IN ('queued', 'running')")
+        .all().map((row) => jobSchema.parse(JSON.parse(row.body)));
+      for (const job of unfinished) {
+        if (job.status === "queued") {
+          // Still waiting for its turn when the gateway stopped, so no remote work exists and the account stays usable.
+          this.saveJob({
+            ...job,
+            status: "failed",
+            error: "The gateway restarted before this job started; submit it again.",
+            finishedAt: new Date().toISOString(),
+          });
+          continue;
+        }
+        if (job.status === "running") {
+          this.saveJob({
+            ...job,
+            status: "unknown",
+            error: "Gateway restarted. Remote work may still be running; check the provider before retrying.",
+            finishedAt: new Date().toISOString(),
+          });
+          const account = this.account(job.accountId);
+          if (account) this.saveAccount({
+            ...account, status: "error",
+            detail: "Interrupted work may still be active remotely. Inspect it before checking this account again.",
+          });
+        }
       }
-      if (job.status === "running") {
-        this.saveJob({
-          ...job,
-          status: "unknown",
-          error: "Gateway restarted. Remote work may still be running; check the provider before retrying.",
-          finishedAt: new Date().toISOString(),
-        });
-        const account = this.account(job.accountId);
-        if (account) this.saveAccount({
-          ...account, status: "error",
-          detail: "Interrupted work may still be active remotely. Inspect it before checking this account again.",
-        });
-      }
-    }
+    })();
   }
 
   private seal(credentials: Credentials): string {

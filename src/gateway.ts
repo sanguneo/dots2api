@@ -6,6 +6,18 @@ import type { DotsAuth } from "./dots-auth";
 
 /** Work one account may hold (running plus waiting) before submit refuses with 429 instead of growing without bound. */
 const QUEUE_LIMIT = 20;
+const DEFAULT_QUEUE_BYTES = 128 * 1024 * 1024;
+
+/** Input retention quota, not a bound on browser/process RSS; avoids retaining twenty maximum-size edits. */
+function queueByteBudget(): number {
+  const raw = process.env["DOTS2API_QUEUE_BYTES"];
+  if (raw === undefined) return DEFAULT_QUEUE_BYTES;
+  const bytes = Number(raw);
+  if (!Number.isSafeInteger(bytes) || bytes < 40 * 1024 * 1024) {
+    throw new GatewayError("gateway_config", "DOTS2API_QUEUE_BYTES must be an integer of at least 40 MiB.", 503);
+  }
+  return bytes;
+}
 
 export class Gateway {
   private readonly busy = new Set<AccountId>();
@@ -19,7 +31,8 @@ export class Gateway {
   /** One serial chain per account, so a job submitted while the account is busy runs after the current one. */
   private readonly chains = new Map<AccountId, Promise<void>>();
   private readonly depths = new Map<AccountId, number>();
-  constructor(readonly store: Store, readonly adapters: Readonly<Record<ProviderId, ProviderAdapter>>, private readonly dotsAuth?: DotsAuth) {}
+  private queuedBytes = 0;
+  constructor(readonly store: Store, readonly adapters: Readonly<Record<ProviderId, ProviderAdapter>>, private readonly dotsAuth?: DotsAuth, private readonly maxQueuedBytes = queueByteBudget()) {}
 
   private async credentials(id: AccountId, signal: AbortSignal): Promise<Credentials> {
     if (this.account(id).provider !== "dots" || !this.dotsAuth) return this.store.credentials(id);
@@ -66,12 +79,16 @@ export class Gateway {
     for (const wake of waiters) wake();
   }
   /** A job waits for a human-facing lease (login, check) to finish before it takes the account. */
-  private async waitForLease(id: AccountId): Promise<void> {
+  private async acquireJob(id: AccountId): Promise<boolean> {
     while (this.leasesHeld.has(id) && !this.shutdown.signal.aborted) {
       const wait = Promise.withResolvers<void>();
       this.leaseWaiters.set(id, [...(this.leaseWaiters.get(id) ?? []), wait.resolve]);
       await wait.promise;
     }
+    if (this.shutdown.signal.aborted) return false;
+    // No await between observing the lease and acquiring ownership. reserve() must see this owner.
+    this.busy.add(id);
+    return true;
   }
   /** Jobs the account holds: the one running plus the ones waiting their turn. */
   private depth(id: AccountId): number { return this.depths.get(id) ?? 0; }
@@ -79,7 +96,7 @@ export class Gateway {
     const next = this.depth(id) - 1;
     if (next > 0) this.depths.set(id, next); else this.depths.delete(id);
   }
-  async drain(): Promise<void> { await Promise.all([...this.leases]); }
+  async drain(): Promise<void> { await Promise.all([...this.tasks.values(), ...this.leases]); }
   accounts(): Account[] { return this.store.accounts().map((a) => ({ ...a, busy: this.busy.has(a.id) })); }
   /** Every registered provider with the operator's on/off switch applied. */
   providerStatuses(): ProviderStatus[] {
@@ -114,7 +131,7 @@ export class Gateway {
     // image count, or the adapter would skip its identity gate, rotate away from it at once and archive it.
     if (account.provider === "dots" && patch.credentials && "threadId" in patch.credentials &&
       patch.credentials["threadId"] !== previous["threadId"]) {
-      for (const key of ["threadOrigin", "threadImageBytes"]) delete previous[key];
+      for (const key of ["threadOrigin", "threadImageBytes", "threadImageAccounting"]) delete previous[key];
     }
     const updated = this.store.saveAccount({
       ...account, label: patch.label ?? account.label, enabled: patch.enabled ?? account.enabled,
@@ -185,16 +202,17 @@ export class Gateway {
     }
   }
   submit(input: { readonly accountId?: AccountId; readonly provider?: ProviderId; readonly prompt: string; readonly referenceImages?: readonly ReferenceImage[] }): Job {
+    if (this.shutdown.signal.aborted) throw new GatewayError("shutting_down", "Gateway is shutting down.", 503);
     if (input.referenceImages) validateReferenceImages(input.referenceImages);
-    // A snapshot, so a queued job still sends the bytes the caller submitted even if the caller's buffer is reused.
-    const referenceImages = input.referenceImages?.map((image) => ({ mime: image.mime, data: new Uint8Array(image.data) }));
     const candidates = this.accounts()
       .filter((a) => a.provider === input.provider && a.enabled && a.status === "ready" && !this.leasesHeld.has(a.id));
     const account = input.accountId
       ? this.account(input.accountId)
-      : candidates.filter((a) => !a.busy).sort((a, b) => (a.lastUsedAt ?? "").localeCompare(b.lastUsedAt ?? ""))[0]
-        // Every candidate is busy: join the shortest queue instead of refusing the work.
-        ?? candidates.sort((a, b) => this.depth(a.id) - this.depth(b.id) || (a.lastUsedAt ?? "").localeCompare(b.lastUsedAt ?? ""))[0];
+      : candidates.filter((a) => this.depth(a.id) < QUEUE_LIMIT)
+        .sort((a, b) => this.depth(a.id) - this.depth(b.id)
+          || (a.lastUsedAt ?? "").localeCompare(b.lastUsedAt ?? "")
+          || a.id.localeCompare(b.id))[0];
+    if (!account && candidates.length) throw new GatewayError("queue_full", "All eligible account queues are full.", 429);
     if (!account) throw new GatewayError("no_account", "No connected account is available for this provider.", 503);
     if (input.provider && account.provider !== input.provider) throw new GatewayError("provider_mismatch", "Account and provider do not match.");
     if (!this.store.providerEnabled(account.provider)) throw new GatewayError("provider_disabled", `${account.provider} is switched off in the console; no new jobs are routed to it.`, 503);
@@ -203,17 +221,26 @@ export class Gateway {
     if (this.leasesHeld.has(account.id)) throw new GatewayError("account_busy", "This account is being connected or checked. Try again when it is free.", 409);
     if (this.depth(account.id) >= QUEUE_LIMIT) throw new GatewayError("queue_full", `This account already has ${QUEUE_LIMIT} jobs waiting.`, 429);
     this.adapters[account.provider].validate(this.store.credentials(account.id));
+    const retainedBytes = input.prompt.length * 2 + (input.referenceImages?.reduce((sum, image) => sum + image.data.byteLength, 0) ?? 0);
+    if (retainedBytes > this.maxQueuedBytes - this.queuedBytes) {
+      throw new GatewayError("queue_bytes_full", "The gateway's retained input byte budget is full.", 429);
+    }
+    // Admission is synchronous. Allocate the caller-independent snapshot only after all limits have passed.
+    const referenceImages = input.referenceImages?.map((image) => ({ mime: image.mime, data: new Uint8Array(image.data) }));
     const waiting = this.depth(account.id) > 0;
     const job: Job = {
       id: jobIdSchema.parse(crypto.randomUUID()), accountId: account.id, provider: account.provider,
       prompt: input.prompt, status: waiting ? "queued" : "running", output: "", error: null, remoteId: null, images: [],
       createdAt: new Date().toISOString(), finishedAt: null,
     };
-    this.store.saveAccount({ ...account, lastUsedAt: job.createdAt });
-    this.store.saveJob(job);
+    this.store.db.transaction(() => {
+      this.store.saveAccount({ ...account, lastUsedAt: job.createdAt });
+      this.store.saveJob(job);
+    })();
+    this.queuedBytes += retainedBytes;
     this.depths.set(account.id, this.depth(account.id) + 1);
     const previous = this.chains.get(account.id) ?? Promise.resolve();
-    const task = previous.then(() => this.startJob(job, referenceImages));
+    const task = previous.then(() => this.startJob(job, referenceImages)).finally(() => { this.queuedBytes -= retainedBytes; });
     const chained = task.then(() => undefined, () => undefined);
     this.chains.set(account.id, chained);
     // The promise a caller waits on covers the queued time as well as the run.
@@ -231,7 +258,7 @@ export class Gateway {
    * failed honestly instead of being sent to a session that is no longer trusted.
    */
   private async startJob(job: Job, referenceImages?: readonly ReferenceImage[]): Promise<Job> {
-    await this.waitForLease(job.accountId);
+    const acquired = await this.acquireJob(job.accountId);
     try {
       const current = this.store.job(job.id) ?? job;
       if (this.shutdown.signal.aborted) return this.abandon(current, "The gateway stopped before this job started.");
@@ -239,7 +266,6 @@ export class Gateway {
       if (!account || !account.enabled || account.status !== "ready") {
         return this.abandon(current, "The account was not ready when this job's turn came; submit it again.");
       }
-      this.busy.add(job.accountId);
       // Registered as a lease so drain() waits for the run to be persisted before the process exits.
       const done = Promise.withResolvers<void>();
       this.leases.add(done.promise);
@@ -249,11 +275,11 @@ export class Gateway {
         this.changed();
         return await this.execute(started, referenceImages);
       } finally {
-        this.busy.delete(job.accountId);
         this.leases.delete(done.promise);
         done.resolve();
       }
     } finally {
+      if (acquired) this.busy.delete(job.accountId);
       this.releaseDepth(job.accountId);
       this.changed();
     }
