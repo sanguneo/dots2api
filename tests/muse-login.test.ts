@@ -6,18 +6,6 @@ import type { MuseLoginBrowser } from "../src/muse-login";
 
 const account = accountIdSchema.parse("44444444-4444-4444-8444-444444444444");
 
-function until(predicate: () => boolean, timeoutMs = 10_000): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const started = Date.now();
-    const tick = () => {
-      if (predicate()) return resolve();
-      if (Date.now() - started > timeoutMs) return reject(new Error("Condition was not met in time."));
-      setTimeout(tick, 25);
-    };
-    tick();
-  });
-}
-
 interface FakeBrowser {
   readonly browser: MuseLoginBrowser;
   readonly closed: () => boolean | null;
@@ -88,12 +76,15 @@ describe("Muse remote login service", () => {
 
   it("expires an idle session and releases its browser", async () => {
     const made: FakeBrowser[] = [];
+    const ended = Promise.withResolvers<void>();
     const service = createMuseLoginService({
       dataDir: "/tmp", lifetimeMs: 150,
+      onEnded: () => ended.resolve(),
       launcher: { async launch() { const fake = fakeBrowser(); made.push(fake); return fake.browser; } },
     });
     await service.start(account);
-    await until(() => service.status(account) === null, 5_000);
+    await ended.promise;
+    expect(service.status(account)).toBeNull();
     expect(made[0]?.closed()).toBe(false);
     expect(made[0]?.listeners()).toBe(0);
     await service.close();
@@ -144,12 +135,19 @@ describe("Muse remote login relay", () => {
       const relay = await attachRelay(context, { site: `http://localhost:${server.port}`, signal: controller.signal });
       expect(relay.viewport).toEqual({ width: 1280, height: 800 });
       // When subscribing, then a real JPEG frame arrives.
+      let unsubscribe = () => {};
       const frame = await new Promise<string>((resolve, reject) => {
         const timer = setTimeout(() => reject(new Error("No screencast frame arrived.")), 20_000);
-        const off = relay.frames((data) => { clearTimeout(timer); off(); resolve(data); });
+        unsubscribe = relay.frames((data) => { clearTimeout(timer); resolve(data); });
       });
+      unsubscribe();
       expect(frame.length).toBeGreaterThan(200);
       expect(Buffer.from(frame, "base64").subarray(0, 2).equals(Buffer.from([0xff, 0xd8]))).toBe(true);
+      const cached: string[] = [];
+      const off = relay.frames((data) => cached.push(data));
+      off();
+      expect(cached).toHaveLength(1);
+      expect(Buffer.from(cached[0] ?? "", "base64").subarray(0, 2).equals(Buffer.from([0xff, 0xd8]))).toBe(true);
       const page = context.pages()[0];
       if (!page) throw new Error("The relay did not open a page.");
       await page.focus("#field");

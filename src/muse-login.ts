@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { resolve } from "node:path";
 import { chromium } from "playwright";
 import type { BrowserContext, CDPSession, Page } from "playwright";
 import { GatewayError } from "./contracts";
@@ -53,8 +53,8 @@ export interface MuseLoginOptions {
 interface Active {
   session: MuseLoginSession;
   browser: MuseLoginBrowser;
-  unsubscribe: () => void;
   timer: ReturnType<typeof setTimeout>;
+  ending?: { readonly state: MuseLoginState; readonly promise: Promise<MuseLoginSession> };
 }
 
 export interface MuseLoginService {
@@ -71,27 +71,43 @@ function sessionView(active: Active): MuseLoginSession {
   return { ...active.session };
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((done) => { setTimeout(done, ms); });
-}
-
 /** Starts a private Xvfb display and returns its name plus a stop function. */
-async function startDisplay(): Promise<{ readonly name: string; readonly stop: () => void }> {
+export async function startDisplay(parent: AbortSignal = new AbortController().signal): Promise<{ readonly name: string; readonly stop: () => void }> {
   const xvfb = Bun.which("Xvfb");
   if (!xvfb) throw new GatewayError("muse_login_dependency", "Install Xvfb on the server to use remote Muse login.", 503);
-  for (let number = 99; number < 130; number++) {
-    if (existsSync(`/tmp/.X11-unix/X${number}`)) continue;
-    const child = Bun.spawn([xvfb, `:${number}`, "-screen", "0", `${VIEWPORT.width}x${VIEWPORT.height}x24`, "-nolisten", "tcp"], {
-      stdio: ["ignore", "ignore", "ignore"],
-    });
-    for (let attempt = 0; attempt < 50; attempt++) {
-      await sleep(100);
-      if (existsSync(`/tmp/.X11-unix/X${number}`)) return { name: `:${number}`, stop: () => { child.kill(); } };
-      if (child.exitCode !== null) break;
+  if (parent.aborted) throw new GatewayError("muse_login_closed", "The login was cancelled.", 409);
+  // Xvfb atomically owns the display it reports on stdout only after the server is ready.
+  const child = Bun.spawn([xvfb, "-displayfd", "1", "-screen", "0", `${VIEWPORT.width}x${VIEWPORT.height}x24`, "-nolisten", "tcp"], {
+    stdin: "ignore", stdout: "pipe", stderr: "ignore",
+  });
+  const reader = child.stdout.getReader();
+  const signal = AbortSignal.any([parent, AbortSignal.timeout(10_000)]);
+  const stop = () => { child.kill(); };
+  const abort = () => { stop(); void reader.cancel().catch(() => {}); };
+  signal.addEventListener("abort", abort, { once: true });
+  const exited = child.exited.then(() => { void reader.cancel().catch(() => {}); });
+  let ready = false;
+  try {
+    let output = "";
+    const decoder = new TextDecoder();
+    while (!signal.aborted) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (output.length + value.byteLength > 128) break;
+      output += decoder.decode(value, { stream: true });
+      if (!output.includes("\n")) continue;
+      const number = output.slice(0, output.indexOf("\n")).trim();
+      if (!/^\d+$/.test(number) || child.exitCode !== null) break;
+      ready = true;
+      return { name: `:${number}`, stop };
     }
-    child.kill();
+    throw new GatewayError("muse_login_display", "A virtual display (Xvfb) could not be started.", 503);
+  } finally {
+    signal.removeEventListener("abort", abort);
+    void reader.cancel().catch(() => {});
+    reader.releaseLock();
+    if (!ready) { stop(); await exited; }
   }
-  throw new GatewayError("muse_login_display", "A virtual display (Xvfb) could not be started.", 503);
 }
 
 function keyParameters(key: string, code: string | undefined): Record<string, unknown> {
@@ -123,6 +139,7 @@ export async function attachRelay(context: BrowserContext, options: RelayOptions
   };
   const onAbort = () => { void context.close().catch(() => {}); stop(); };
   options.signal.addEventListener("abort", onAbort, { once: true });
+  if (options.signal.aborted) onAbort();
   try {
     for (const extra of context.pages().slice(1)) await extra.close();
     const page: Page = context.pages()[0] ?? await context.newPage();
@@ -189,7 +206,7 @@ export async function attachRelay(context: BrowserContext, options: RelayOptions
 
 async function launchChromium(accountId: AccountId, options: { readonly dataDir: string; readonly site: string; readonly signal: AbortSignal }): Promise<MuseLoginBrowser> {
   // A headless server needs its own display; a desktop host (macOS) uses the native one.
-  const display = process.platform === "linux" ? await startDisplay() : undefined;
+  const display = process.platform === "linux" ? await startDisplay(options.signal) : undefined;
   const stopDisplay = () => display?.stop();
   const bundled = chromium.executablePath();
   const system = ["/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/google-chrome"].find(existsSync);
@@ -220,76 +237,102 @@ export function createMuseLoginService(options: MuseLoginOptions): MuseLoginServ
   const lifetimeMs = options.lifetimeMs ?? DEFAULT_LIFETIME_MS;
   const launcher = options.launcher ?? { launch: launchChromium };
   const active = new Map<AccountId, Active>();
+  const pending = new Map<AccountId, { readonly controller: AbortController; readonly promise: Promise<MuseLoginSession> }>();
   let closed = false;
+  let closing: Promise<void> | undefined;
 
-  const finish = async (entry: Active, state: MuseLoginState, complete: boolean): Promise<MuseLoginSession> => {
-    clearTimeout(entry.timer);
-    entry.unsubscribe();
-    entry.session = { ...entry.session, state: state === "completed" ? "completing" : entry.session.state };
-    let failure: GatewayError | undefined;
-    try {
-      await entry.browser.close(complete);
-    } catch (error) {
-      failure = error instanceof GatewayError ? error : new GatewayError("muse_login_shutdown", "The login browser did not close cleanly.", 502);
+  const finish = (entry: Active, state: MuseLoginState, complete: boolean): Promise<MuseLoginSession> => {
+    if (entry.ending) {
+      return entry.ending.state === state ? entry.ending.promise
+        : Promise.reject(new GatewayError("muse_login_state", "This login session is already ending.", 409));
     }
-    active.delete(entry.session.accountId);
-    entry.session = {
-      ...entry.session,
-      state: failure ? "failed" : state,
-      error: failure ? { code: failure.code, message: failure.message } : null,
-    };
-    options.onEnded?.(sessionView(entry));
-    if (failure) throw failure;
-    return sessionView(entry);
+    clearTimeout(entry.timer);
+    entry.session = { ...entry.session, state: state === "completed" ? "completing" : state };
+    // Publish the flight before invoking browser code or terminal callbacks.
+    const promise = Promise.resolve().then(async () => {
+      let failure: GatewayError | undefined;
+      try {
+        await entry.browser.close(complete);
+      } catch (error) {
+        failure = error instanceof GatewayError ? error : new GatewayError("muse_login_shutdown", "The login browser did not close cleanly.", 502);
+      }
+      if (active.get(entry.session.accountId) === entry) active.delete(entry.session.accountId);
+      entry.session = {
+        ...entry.session, state: failure ? "failed" : state,
+        error: failure ? { code: failure.code, message: failure.message } : null,
+      };
+      options.onEnded?.(sessionView(entry));
+      if (failure) throw failure;
+      return sessionView(entry);
+    });
+    entry.ending = { state, promise };
+    return promise;
   };
 
   return {
-    async start(accountId) {
-      if (closed) throw new GatewayError("muse_login_closed", "The server is shutting down.", 503);
-      const existing = active.get(accountId);
-      if (existing) await finish(existing, "cancelled", false);
+    start(accountId) {
+      if (closed) return Promise.reject(new GatewayError("muse_login_closed", "The server is shutting down.", 503));
+      if (pending.has(accountId)) return Promise.reject(new GatewayError("muse_login_state", "A login session is already starting.", 409));
       const controller = new AbortController();
-      let browser: MuseLoginBrowser;
-      try {
-        browser = await launcher.launch(accountId, { dataDir: options.dataDir, site, signal: controller.signal });
-      } catch (error) {
-        throw error instanceof GatewayError ? error : new GatewayError("muse_login_browser", "The login browser could not start.", 503);
-      }
-      const entry: Active = {
-        session: {
-          id: crypto.randomUUID(), accountId, state: "active",
-          expiresAt: new Date(Date.now() + lifetimeMs).toISOString(), error: null,
-        },
-        browser, unsubscribe: () => {},
-        timer: setTimeout(() => { void finish(entry, "expired", false).catch(() => {}); }, lifetimeMs),
-      };
-      entry.timer.unref?.();
-      active.set(accountId, entry);
-      return sessionView(entry);
+      const promise = Promise.resolve().then(async () => {
+        try {
+          const existing = active.get(accountId);
+          if (existing) await finish(existing, "cancelled", false);
+          if (closed) throw new GatewayError("muse_login_closed", "The server is shutting down.", 503);
+          const browser = await launcher.launch(accountId, { dataDir: options.dataDir, site, signal: controller.signal });
+          if (closed || controller.signal.aborted) {
+            await browser.close(false);
+            throw new GatewayError("muse_login_closed", "The server is shutting down.", 503);
+          }
+          const entry: Active = {
+            session: {
+              id: crypto.randomUUID(), accountId, state: "active",
+              expiresAt: new Date(Date.now() + lifetimeMs).toISOString(), error: null,
+            },
+            browser,
+            timer: setTimeout(() => { void finish(entry, "expired", false).catch(() => {}); }, lifetimeMs),
+          };
+          entry.timer.unref?.();
+          active.set(accountId, entry);
+          return sessionView(entry);
+        } catch (error) {
+          throw error instanceof GatewayError ? error : new GatewayError("muse_login_browser", "The login browser could not start.", 503);
+        } finally {
+          if (pending.get(accountId)?.controller === controller) pending.delete(accountId);
+        }
+      });
+      pending.set(accountId, { controller, promise });
+      return promise;
     },
     status(accountId) {
       const entry = active.get(accountId);
       return entry ? sessionView(entry) : null;
     },
-    async complete(accountId, sessionId) {
+    complete(accountId, sessionId) {
       const entry = active.get(accountId);
-      if (!entry) throw new GatewayError("muse_login_state", "No login session is active for this account.", 409);
-      if (entry.session.id !== sessionId) throw new GatewayError("muse_login_state", "This login session is no longer current.", 409);
+      if (!entry || entry.session.id !== sessionId) return Promise.reject(new GatewayError("muse_login_state", "No matching login session is active.", 409));
       return finish(entry, "completed", true);
     },
-    async cancel(accountId, sessionId) {
+    cancel(accountId, sessionId) {
       const entry = active.get(accountId);
       if (!entry || entry.session.id !== sessionId) {
-        throw new GatewayError("muse_login_state", "No matching login session is active.", 409);
+        return Promise.reject(new GatewayError("muse_login_state", "No matching login session is active.", 409));
       }
       return finish(entry, "cancelled", false);
     },
     activeBrowser(accountId) {
-      return active.get(accountId)?.browser ?? null;
+      const entry = active.get(accountId);
+      return entry && !entry.ending ? entry.browser : null;
     },
-    async close() {
+    close() {
+      if (closing) return closing;
       closed = true;
-      for (const entry of [...active.values()]) await finish(entry, "cancelled", false).catch(() => {});
+      for (const launch of pending.values()) launch.controller.abort();
+      closing = Promise.allSettled([
+        ...[...pending.values()].map((launch) => launch.promise),
+        ...[...active.values()].map((entry) => entry.ending?.promise ?? finish(entry, "cancelled", false)),
+      ]).then(() => {});
+      return closing;
     },
   };
 }

@@ -1,5 +1,4 @@
 import { resolve } from "node:path";
-import type { ServerWebSocket } from "bun";
 import { createApi } from "./api";
 import { Gateway } from "./gateway";
 import { Store } from "./store";
@@ -11,17 +10,22 @@ import { createMuseLoginService } from "./muse-login";
 import { MuseLoginRoutes } from "./muse-login-routes";
 import { accountIdSchema } from "./contracts";
 import { MAX_IMAGE_BYTES } from "./images";
+import { createMuseViewer } from "./muse-viewer";
+import type { ViewerData } from "./muse-viewer";
 
 const store = new Store(resolve(process.env["DOTS2API_DATA_DIR"] ?? "data"));
 store.recoverInterruptedJobs();
 const dotsAuth = new DotsAuth();
 const gateway = new Gateway(store, { dots: dotsAdapter, muse: museAdapter }, dotsAuth);
-const museLogin = createMuseLoginService({ dataDir: store.dataDir, onEnded: (session) => museRoutes.handleEnded(session) });
+const museLogin = createMuseLoginService({ dataDir: store.dataDir, onEnded: (session) => {
+  museViewer.closeSession(session.id);
+  museRoutes.handleEnded(session);
+} });
+const museViewer = createMuseViewer(museLogin);
 const museRoutes = new MuseLoginRoutes(gateway, museLogin);
 const api = createApi(gateway, dotsAuth, museRoutes);
 let stopping = false;
 
-interface ViewerData { readonly accountId: string; unsubscribe?: () => void; }
 const STREAM_PATH = /^\/api\/accounts\/([^/]+)\/muse-login\/stream$/;
 
 /** The viewer WebSocket is same-origin only and exists just while a login session is active. */
@@ -33,8 +37,9 @@ function upgradeViewer(request: Request, server: Bun.Server<ViewerData>): Respon
   const origin = request.headers.get("origin");
   if (origin && origin !== url.origin) return new Response("Origin is not allowed.", { status: 403 });
   const accountId = accountIdSchema.safeParse(decodeURIComponent(match[1]));
-  if (!accountId.success || !museLogin.activeBrowser(accountId.data)) return new Response("No active login session.", { status: 404 });
-  return server.upgrade(request, { data: { accountId: accountId.data } }) ? undefined : new Response("Upgrade failed.", { status: 400 });
+  const data = accountId.success ? museViewer.data(accountId.data) : null;
+  if (!data) return new Response("No active login session.", { status: 404 });
+  return server.upgrade(request, { data }) ? undefined : new Response("Upgrade failed.", { status: 400 });
 }
 
 const server = Bun.serve<ViewerData>({
@@ -47,20 +52,7 @@ const server = Bun.serve<ViewerData>({
   maxRequestBodySize: MAX_IMAGE_BYTES + 4 * 1024 * 1024,
   development: process.env["NODE_ENV"] !== "production",
   routes: { "/": index },
-  websocket: {
-    open(ws: ServerWebSocket<ViewerData>) {
-      const browser = museLogin.activeBrowser(accountIdSchema.parse(ws.data.accountId));
-      if (!browser) { ws.close(1011, "No active login session."); return; }
-      ws.data.unsubscribe = browser.frames((frame) => { try { ws.send(JSON.stringify({ t: "frame", d: frame })); } catch { return; } });
-      ws.send(JSON.stringify({ t: "ready", w: browser.viewport.width, h: browser.viewport.height }));
-    },
-    message(ws: ServerWebSocket<ViewerData>, raw: string | Buffer) {
-      const browser = museLogin.activeBrowser(accountIdSchema.parse(ws.data.accountId));
-      if (!browser) return;
-      try { browser.input(JSON.parse(typeof raw === "string" ? raw : raw.toString("utf8"))); } catch { return; }
-    },
-    close(ws: ServerWebSocket<ViewerData>) { ws.data.unsubscribe?.(); },
-  },
+  websocket: museViewer.websocket,
   fetch(request, server) {
     if (stopping) return new Response("Server is shutting down.", { status: 503 });
     if (request.headers.get("upgrade")?.toLowerCase() === "websocket") {
