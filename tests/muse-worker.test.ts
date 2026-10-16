@@ -130,3 +130,25 @@ test("headerless image overflow cancels its stream before blob/base64 allocation
     expect(cancelled).toBe(true);
   } finally { globalThis.fetch = originalFetch; }
 });
+
+if (process.platform === "linux") {
+  test("force-kills a real Node worker that ignores graceful termination", async () => {
+    // Given a real worker that has installed its SIGTERM handler before publishing readiness.
+    const child = Bun.spawn(["node", "-e", "process.on('SIGTERM',()=>{}); process.stdout.write('READY\\n'); process.stdin.resume()"], {
+      stdin: "pipe", stdout: "pipe", stderr: "ignore",
+    });
+    const reader = child.stdout.getReader();
+    const scheduled = new Map<number, () => void>();
+    try {
+      const ready = await reader.read();
+      expect(new TextDecoder().decode(ready.value)).toBe("READY\n");
+      // When cleanup reaches the grace deadline through a controlled scheduler.
+      const stopping = stopWorker(child, (callback, ms) => { scheduled.set(ms, callback); return () => { scheduled.delete(ms); }; });
+      scheduled.get(5_000)?.();
+      await stopping;
+      // Then the actual OS process has exited by SIGKILL, not merely a resolved mock promise.
+      await child.exited;
+      expect(child.signalCode).toBe("SIGKILL");
+    } finally { reader.releaseLock(); child.kill("SIGKILL"); }
+  });
+}
