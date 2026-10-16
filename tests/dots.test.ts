@@ -192,6 +192,167 @@ test("run returns a generated image carried by the completed turn", async () => 
   });
 });
 
+test.each([false, true])("does not replay delivered work because unrelated prose mentions the image limit, references=%s", async (references) => {
+  const methods: string[] = [];
+  const accepted: (string | null)[] = [];
+  // Given acceptance and a delivered side effect preceding an unrelated failure.
+  await withServer((peer, request) => {
+    methods.push(request.method);
+    if (handshake(peer, request) || request.method !== "turn/start") return;
+    reply(peer, request, { turn: { id: "accepted-turn" } });
+    peer.send(JSON.stringify({ method: "item/completed", params: {
+      threadId: "dot-thread", turnId: "accepted-turn", item: delivered,
+    } }));
+    peer.send(JSON.stringify({ method: "turn/completed", params: {
+      threadId: "dot-thread", turn: { id: "accepted-turn", status: "failed", items: [],
+        error: { message: '{"error":{"code":"other_error","message":"Failure after output; not image_request_too_large"}}' } },
+    } }));
+  }, async (credentials) => {
+    // When failure is classified under the new no-replay contract.
+    await expect(dotsAdapter.run({ ...credentials, threadImageBytes: "1024" }, "work", {
+      ...context, saveCredentials: () => {}, onAccepted: (id) => { accepted.push(id); },
+      ...(references ? { referenceImages: [{ mime: "image/png" as const, data: new Uint8Array(Buffer.from(PNG_BASE64, "base64")) }] } : {}),
+    })).rejects.toMatchObject({ code: "dots_turn" });
+  });
+  // Then the first remote identifier remains the only accepted attempt.
+  expect(accepted).toEqual(["accepted-turn"]);
+  expect(methods.filter((method) => method === "turn/start")).toHaveLength(1);
+  expect(methods).not.toContain("thread/start");
+});
+
+test.each([undefined, null, ""])("requires provenance when the selected thread source is %s", async (source) => {
+  const submitted: string[] = [];
+  // Given an unlabelled operator-selected thread without a self marker.
+  await withServer((peer, request) => {
+    if (request.method === "thread/read") {
+      reply(peer, request, { thread: { id: "dot-thread", threadSource: source, modelProvider: "local" } });
+      return;
+    }
+    if (request.method === "turn/start") submitted.push(String(request.params.threadId));
+    handshake(peer, request);
+  }, async (credentials) => {
+    // When the account has no durable evidence of owning the thread.
+    await expect(dotsAdapter.run(credentials, "work", context)).rejects.toMatchObject({ code: "dots_thread_unverified" });
+  });
+  // Then no original-thread submission took place.
+  expect(submitted).toEqual([]);
+});
+
+test("recovers an unresolved second image and merges the first by its remote ID", async () => {
+  let lists = 0;
+  const saved: Credentials[] = [];
+  // Given one inline image and one known image whose bytes were omitted.
+  await withServer((peer, request) => {
+    if (handshake(peer, request)) return;
+    if (request.method === "turn/start") {
+      reply(peer, request, { turn: { id: "turn-1" } });
+      peer.send(JSON.stringify({ method: "turn/completed", params: {
+        threadId: "dot-thread", turn: { id: "turn-1", status: "completed",
+          items: [generated({ id: "A", result: PNG_BASE64 }), generated({ id: "B", result: null })] },
+      } }));
+    }
+    if (request.method === "thread/turns/list") {
+      lists++;
+      reply(peer, request, { data: [{ id: "turn-1", items: [
+        generated({ id: "A", result: PNG_BASE64 }), generated({ id: "B", result: PNG_BASE64 }),
+      ] }] });
+    }
+  }, async (credentials) => {
+    // When the completed result is assembled.
+    const result = await dotsAdapter.run(credentials, "draw", { ...context, saveCredentials: (value) => { saved.push(value); } });
+    // Then both unique images are returned and counted once each.
+    expect(result.images).toHaveLength(2);
+    expect(saved.at(-1)?.["threadImageBytes"]).toBe(String(2 * Buffer.from(PNG_BASE64, "base64").length));
+    expect(saved.at(-1)?.["threadImageAccounting"]).toBe("complete");
+  });
+  expect(lists).toBe(1);
+});
+
+test("recovers attachments announced only in individual item notifications", async () => {
+  let lists = 0;
+  // Given a streamed attachment indication absent from the final snapshot.
+  await withServer((peer, request) => {
+    if (handshake(peer, request)) return;
+    if (request.method === "turn/start") {
+      reply(peer, request, { turn: { id: "turn-1" } });
+      peer.send(JSON.stringify({ method: "item/completed", params: { threadId: "dot-thread", turnId: "turn-1", item: delivered } }));
+      peer.send(JSON.stringify({ method: "turn/completed", params: { threadId: "dot-thread", turn: { id: "turn-1", status: "completed", items: [] } } }));
+    }
+    if (request.method === "thread/turns/list") {
+      lists++;
+      reply(peer, request, { data: [{ id: "turn-1", items: [generated({ result: PNG_BASE64 })] }] });
+    }
+  }, async (credentials) => {
+    // When the result completes, then its attachment is downloaded.
+    const result = await dotsAdapter.run(credentials, "draw", context);
+    expect(result.images).toHaveLength(1);
+  });
+  expect(lists).toBe(1);
+});
+
+test("counts nine generated images while returning eight and adds references once", async () => {
+  const saved: Credentials[] = [];
+  // Given nine distinct generated items and one reference of the same byte length.
+  await withServer((peer, request) => {
+    if (handshake(peer, request) || request.method !== "turn/start") return;
+    reply(peer, request, { turn: { id: "turn-1" } });
+    peer.send(JSON.stringify({ method: "turn/completed", params: { threadId: "dot-thread",
+      turn: { id: "turn-1", status: "completed", items: Array.from({ length: 9 }, (_, i) => generated({ id: `image-${i}`, result: PNG_BASE64 })) } } }));
+  }, async (credentials) => {
+    // When accounting is saved independently of public output truncation.
+    const result = await dotsAdapter.run(credentials, "draw", {
+      ...context, referenceImages: [{ mime: "image/png", data: new Uint8Array(Buffer.from(PNG_BASE64, "base64")) }],
+      saveCredentials: (value) => { saved.push(value); },
+    });
+    // Then every generated/reference byte is counted exactly once.
+    expect(result.images).toHaveLength(8);
+    expect(saved.at(-1)?.["threadImageBytes"]).toBe(String(10 * Buffer.from(PNG_BASE64, "base64").length));
+  });
+});
+
+test("rotates before another job when known image bytes could not be recovered", async () => {
+  const saved: Credentials[] = [];
+  const targets: string[] = [];
+  // Given a completed image with no retrievable bytes followed by another job.
+  await withServer((peer, request) => {
+    if (handshake(peer, request)) return;
+    if (request.method === "thread/start") { reply(peer, request, { thread: { id: "fresh" } }); return; }
+    if (request.method === "thread/turns/list") { reply(peer, request, { data: [] }); return; }
+    if (request.method !== "turn/start") return;
+    const thread = String(request.params.threadId);
+    targets.push(thread);
+    reply(peer, request, { turn: { id: "turn-1" } });
+    peer.send(JSON.stringify({ method: "turn/completed", params: { threadId: thread,
+      turn: { id: "turn-1", status: "completed", items: thread === "dot-thread"
+        ? [generated({ result: null })] : [{ id: "answer", type: "agentMessage", text: "done" }] } } }));
+  }, async (credentials) => {
+    await dotsAdapter.run(credentials, "first", { ...context, saveCredentials: (value) => { saved.push(value); } });
+    const repaired = saved.at(-1);
+    if (!repaired) throw new Error("Expected incomplete accounting");
+    expect(repaired["threadImageAccounting"]).toBe("incomplete");
+    // When the next job starts with that durable accounting.
+    await dotsAdapter.run(repaired, "next", { ...context, saveCredentials: (value) => { saved.push(value); } });
+  });
+  // Then it never sends the next job back to the incompletely counted thread.
+  expect(targets).toEqual(["dot-thread", "fresh"]);
+});
+
+test("bounds early notification accumulation after submission without replay", async () => {
+  let submissions = 0;
+  // Given a provider flooding the connection before acknowledging its submitted turn.
+  await withServer((peer, request) => {
+    if (handshake(peer, request) || request.method !== "turn/start") return;
+    submissions++;
+    for (let i = 0; i < 257; i++) peer.send(JSON.stringify({ method: "fixture/progress", params: { threadId: "dot-thread", index: i } }));
+  }, async (credentials) => {
+    // When the finite notification queue fills.
+    await expect(dotsAdapter.run(credentials, "work", { ...context, saveCredentials: () => {} }))
+      .rejects.toMatchObject({ code: "dots_resource_limit", uncertain: true });
+  });
+  // Then no retry turns the resource failure into duplicate work.
+  expect(submissions).toBe(1);
+});
+
 test("run downloads the image from the turn list when the completed turn omits its bytes", async () => {
   const methods: string[] = [];
   // Given a turn that only reports a delivered attachment, while the full turn list holds the image.
@@ -378,7 +539,7 @@ test("run does not rebind a reclaimed thread without a credential store", async 
     const failure = await dotsAdapter.run(credentials, "Hello Dot", context).catch((error: unknown) => error);
     // Then the reclaimed thread is reported with the upstream reason and no replacement is created.
     expect(failure).toBeInstanceOf(GatewayError);
-    expect(failure).toMatchObject({ code: "dots_thread_missing", status: 502, uncertain: true });
+    expect(failure).toMatchObject({ code: "dots_thread_missing", status: 502, uncertain: false });
     expect((failure as GatewayError).message).toContain("thread not found");
     expect((failure as GatewayError).message).toContain("-32600");
   });
@@ -603,7 +764,7 @@ test("run leaves a thread the operator selected unarchived when it rotates away 
   expect(archived).toEqual([]);
 });
 
-test("run rotates the thread and retries when Dot refuses a text turn for its image content", async () => {
+test("run does not replay an accepted text turn after an image-limit failure", async () => {
   const methods: string[] = [];
   const saved: Credentials[] = [];
   // Given a thread Dot refuses because its resolved image content is too large.
@@ -634,14 +795,13 @@ test("run rotates the thread and retries when Dot refuses a text turn for its im
     reply(peer, request, { turn: { id: "turn-2", status: "inProgress" } });
   }, async (credentials) => {
     // When a text-only prompt hits the refused thread.
-    const result = await dotsAdapter.run(credentials, "Hello Dot", {
+    await expect(dotsAdapter.run(credentials, "Hello Dot", {
       ...context, saveCredentials: (repaired) => { saved.push(repaired); },
-    });
-    expect(result).toEqual({ text: "Recovered", remoteId: "turn-2" });
+    })).rejects.toMatchObject({ code: "dots_turn" });
   });
-  // Then the thread is replaced once and the replacement is persisted for later jobs.
-  expect(methods).toEqual(["initialize", "initialized", "thread/read", "thread/resume", "turn/start", "thread/start", "turn/start"]);
-  expect(saved[0]).toMatchObject({ threadId: "fresh-thread", threadOrigin: "self", threadImageBytes: "0" });
+  // Then the accepted turn is not replayed and accounting forces a fresh next job.
+  expect(methods).toEqual(["initialize", "initialized", "thread/read", "thread/resume", "turn/start"]);
+  expect(saved[0]).toMatchObject({ threadId: "dot-thread", threadImageAccounting: "incomplete" });
 });
 
 test("run keeps the thread when the refused request carried its own reference image", async () => {
@@ -701,7 +861,7 @@ test("run replaces a thread before submitting when a reference image would push 
   expect(saved[1]).toMatchObject({ threadId: "fresh-thread", threadOrigin: "self", threadImageBytes: String(reference.length) });
 });
 
-test("run rotates the thread and retries when Dot refuses a reference-image turn on a thread that already holds images", async () => {
+test("run does not replay an accepted reference turn on a non-empty thread", async () => {
   const methods: string[] = [];
   const saved: Credentials[] = [];
   const reference = new Uint8Array(Buffer.from(PNG_BASE64, "base64"));
@@ -730,16 +890,15 @@ test("run rotates the thread and retries when Dot refuses a reference-image turn
     } }));
     reply(peer, request, { turn: { id: "turn-2", status: "inProgress" } });
   }, async (credentials) => {
-    const result = await dotsAdapter.run({ ...credentials, threadImageBytes: "1024" }, "edit", {
+    await expect(dotsAdapter.run({ ...credentials, threadImageBytes: "1024" }, "edit", {
       ...context,
       referenceImages: [{ mime: "image/png", data: reference }],
       saveCredentials: (repaired) => { saved.push(repaired); },
-    });
-    expect(result).toEqual({ text: "Edited", remoteId: "turn-2" });
+    })).rejects.toMatchObject({ code: "dots_turn" });
   });
-  expect(methods).toEqual(["initialize", "initialized", "thread/read", "thread/resume", "turn/start", "thread/start", "turn/start"]);
-  expect(saved).toHaveLength(2);
-  expect(saved[1]).toMatchObject({ threadId: "fresh-thread", threadOrigin: "self", threadImageBytes: String(reference.length) });
+  expect(methods).toEqual(["initialize", "initialized", "thread/read", "thread/resume", "turn/start"]);
+  expect(saved).toHaveLength(1);
+  expect(saved[0]).toMatchObject({ threadId: "dot-thread", threadImageAccounting: "incomplete", threadImageBytes: String(1024 + reference.length) });
 });
 
 test("run records the image content a turn leaves on the thread", async () => {

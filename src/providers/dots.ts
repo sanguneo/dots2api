@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { type AdapterContext, type CheckResult, type Credentials, GatewayError, type ProviderAdapter, type ReferenceImage, type RunImage, type RunResult } from "../contracts";
-import { decodeImage, MAX_IMAGES, validateReferenceImages } from "../images";
-import { DotConnection } from "./dots/connection";
+import { decodeImage, MAX_IMAGES, MAX_IMAGE_BYTES, validateReferenceImages } from "../images";
+import { DotConnection, DotRpcError } from "./dots/connection";
 
 const DEFAULT_ENDPOINT = "wss://codex-cloud-backend.chatgpt.com";
 const TIMEOUT_MS = 300_000;
@@ -114,9 +114,6 @@ function turnFailureReason(error: z.infer<typeof turnErrorSchema>): string {
 /** Failures that mean the stored thread can no longer serve turns and must be replaced. */
 const REBINDABLE = new Set(["dots_thread_missing", "dots_thread_unverified"]);
 
-/** Dot's own refusal code for a thread whose resolved image content has grown past its limit. */
-const THREAD_IMAGE_LIMIT = "image_request_too_large";
-
 /**
  * A thread keeps every image its turns produced, and Dot refuses a turn once that resolved content is too large; the
  * thread then refuses every following text turn. Rotation is proactive because the limit is a property of the thread,
@@ -130,11 +127,6 @@ const THREAD_IMAGE_BUDGET_BYTES = 8 * 1024 * 1024;
 function threadImageBytes(credentials: Credentials): number {
   const stored = Number(credentials["threadImageBytes"]);
   return Number.isFinite(stored) && stored > 0 ? stored : 0;
-}
-
-/** True when Dot refused the turn because the thread - not the request - holds too much image content. */
-function threadAtImageLimit(error: unknown): boolean {
-  return error instanceof GatewayError && error.code === "dots_turn" && error.message.includes(THREAD_IMAGE_LIMIT);
 }
 
 /** Tracks whether a submitted turn has left the client; cleared only before a safely retryable submission. */
@@ -174,15 +166,10 @@ async function withConnection<T>(
 }
 
 /** The completed-turn payload may omit the (very large) image bytes; the turn list returns them in full. */
-async function turnImages(connection: DotConnection, threadId: string, turnId: string): Promise<RunImage[]> {
+async function turnItems(connection: DotConnection, threadId: string, turnId: string): Promise<readonly unknown[]> {
   const listed = turnListSchema.safeParse(await connection.request("thread/turns/list", { threadId, limit: 5, itemsView: "full" }));
   if (!listed.success) throw new GatewayError("dots_protocol", "Dot turn list response was invalid.", 502);
-  const items = listed.data.data.find((turn) => turn.id === turnId)?.items ?? [];
-  return items.flatMap((raw) => {
-    const item = imageItemSchema.safeParse(raw);
-    const image = item.success && item.data.status === "completed" && item.data.result ? decodeImage(item.data.result) : null;
-    return image ? [{ ...image, ...(item.success && item.data.revisedPrompt ? { revisedPrompt: item.data.revisedPrompt } : {}) }] : [];
-  });
+  return listed.data.data.find((turn) => turn.id === turnId)?.items ?? [];
 }
 
 async function existingThread(connection: DotConnection, threadId: string, selfProvisioned = false): Promise<void> {
@@ -194,13 +181,13 @@ async function existingThread(connection: DotConnection, threadId: string, selfP
   if (thread.threadSource && thread.threadSource !== "aeon") {
     throw new GatewayError("dots_thread", "Selected thread is not an Aeon Dot thread.", 400);
   }
+  if (thread.threadSource !== "aeon" && !selfProvisioned) {
+    throw new GatewayError("dots_thread_unverified", "Selected thread has no verified Aeon source or gateway ownership.", 400);
+  }
   // A thread whose record outlives its agent still answers reads but can never accept a turn again.
   if (thread.modelProvider === "" || thread.canAcceptDirectInput === false) {
     throw new GatewayError("dots_thread_missing", "Existing Dot thread has no live agent.", 502);
   }
-  // A thread without an Aeon source is one this gateway created as a replacement, so its own creation is the
-  // authorization; a different, explicitly labelled source is not ours to drive.
-  if (selfProvisioned || !thread.threadSource) return;
 }
 
 /** Submits one turn and returns the acceptance Dot reported. */
@@ -250,7 +237,7 @@ async function provisionThread(
   const created = createdThreadSchema.safeParse(await connection.request("thread/start", {}));
   if (!created.success) throw new GatewayError("dots_thread", "Dot did not create a replacement thread.", 502);
   const threadId = created.data.thread.id;
-  save({ ...credentials, threadId, threadOrigin: "self", threadImageBytes: "0" });
+  save({ ...credentials, threadId, threadOrigin: "self", threadImageBytes: "0", threadImageAccounting: "complete" });
   // The replacement is durable before the thread it supersedes is archived, so this can never strand the account.
   await archiveReplacedThread(connection, credentials);
   return threadId;
@@ -294,31 +281,53 @@ async function archiveThread(connection: DotConnection, threadId: string): Promi
   }
 }
 
+/** Accounting covers every observed image, independently of the public eight-image result limit. */
+type CollectedTurn = {
+  readonly result: RunResult;
+  readonly imageBytes: number;
+  readonly imagesComplete: boolean;
+};
+
 /** Waits for one submitted turn and assembles its answer; a turn Dot did not complete is reported with its reason. */
-async function collectTurn(connection: DotConnection, threadId: string, turnId: string): Promise<RunResult> {
+async function collectTurn(connection: DotConnection, threadId: string, turnId: string): Promise<CollectedTurn> {
   const messages = new Map<string, string>();
   const delivered = new Map<string, string>();
   const images = new Map<string, RunImage>();
-  let imageMissing = false;
-  const noteImage = (raw: unknown): void => {
+  const unresolved = new Set<string>();
+  const attachments = new Set<string>();
+  let imageBytes = 0;
+  const noteItem = (raw: unknown): void => {
+    const delivery = deliveredMessageSchema.safeParse(raw);
+    if (delivery.success) {
+      delivered.set(delivery.data.id, delivery.data.arguments.text);
+      for (const id of delivery.data.arguments.library_file_ids ?? []) attachments.add(id);
+    }
+    const message = agentItemSchema.safeParse(raw);
+    if (message.success) messages.set(message.data.id, message.data.text);
     const item = imageItemSchema.safeParse(raw);
-    if (!item.success || item.data.status !== "completed") return;
+    if (!item.success || item.data.status !== "completed" || images.has(item.data.id)) return;
+    if (item.data.result) {
+      const payload = item.data.result.startsWith("data:") ? item.data.result.slice(item.data.result.indexOf(",") + 1) : item.data.result;
+      // Bound the whole job before decoding another image, not just each individual file.
+      if (imageBytes + Buffer.byteLength(payload, "base64") > MAX_IMAGE_BYTES) {
+        throw new GatewayError("dots_resource_limit", "Dot exceeded the 32 MiB retained image budget.", 502, true);
+      }
+    }
     const image = item.data.result ? decodeImage(item.data.result) : null;
-    if (image) images.set(item.data.id, { ...image, ...(item.data.revisedPrompt ? { revisedPrompt: item.data.revisedPrompt } : {}) });
-    else imageMissing = true;
+    if (image) {
+      images.set(item.data.id, { ...image, ...(item.data.revisedPrompt ? { revisedPrompt: item.data.revisedPrompt } : {}) });
+      imageBytes += image.data.byteLength;
+      unresolved.delete(item.data.id);
+    } else {
+      unresolved.add(item.data.id);
+    }
   };
   while (true) {
     const event = await connection.next();
     if (event.method === "item/completed") {
       const completedItem = completedItemSchema.safeParse(event.params);
       if (completedItem.success && completedItem.data.threadId === threadId && completedItem.data.turnId === turnId) {
-        const delivery = deliveredMessageSchema.safeParse(completedItem.data.item);
-        if (delivery.success) delivered.set(delivery.data.id, delivery.data.arguments.text);
-        noteImage(completedItem.data.item);
-      }
-      const item = messageSchema.safeParse(event.params);
-      if (item.success && item.data.threadId === threadId && item.data.turnId === turnId) {
-        messages.set(item.data.item.id, item.data.item.text);
+        noteItem(completedItem.data.item);
       }
     }
     if (event.method !== "turn/completed") continue;
@@ -331,27 +340,27 @@ async function collectTurn(connection: DotConnection, threadId: string, turnId: 
         ? `Dot turn finished without successful completion (status "${status}"): ${reason}`
         : `Dot turn finished without successful completion (status "${status}").`, 502);
     }
-    for (const raw of completed.data.turn.items ?? []) {
-      const delivery = deliveredMessageSchema.safeParse(raw);
-      if (delivery.success) {
-        delivered.set(delivery.data.id, delivery.data.arguments.text);
-        if (delivery.data.arguments.library_file_ids?.length && images.size === 0) imageMissing = true;
-      }
-      noteImage(raw);
-      const item = agentItemSchema.safeParse(raw);
-      if (item.success) messages.set(item.data.id, item.data.text);
-    }
+    for (const raw of completed.data.turn.items ?? []) noteItem(raw);
     let text = [...(delivered.size ? delivered : messages).values()].join("\n\n").trim();
-    if (!text && images.size === 0 && !imageMissing) throw new GatewayError("dots_result", "Dot completed without an agent text response.", 502, true);
-    if (imageMissing && images.size === 0) {
+    if (!text && images.size === 0 && !unresolved.size && !attachments.size) throw new GatewayError("dots_result", "Dot completed without an agent text response.", 502, true);
+    let recoveredAttachments = images.size >= attachments.size;
+    if (unresolved.size || !recoveredAttachments) {
       try {
-        for (const image of await turnImages(connection, threadId, turnId)) images.set(`list-${images.size}`, image);
+        // Library IDs and image-generation IDs are different namespaces. Even a partial inline image
+        // does not prove the attachments were recovered; inspect the full turn and merge by image ID.
+        for (const raw of await turnItems(connection, threadId, turnId)) noteItem(raw);
+        recoveredAttachments = images.size >= attachments.size;
       } catch (error) {
-        if (!(error instanceof GatewayError)) throw error;
+        if (!(error instanceof GatewayError) || error.code === "dots_resource_limit") throw error;
       }
-      if (images.size === 0) text += "\n\n[dots2api] The Dot generated an image, but it could not be downloaded; open the Dot thread in ChatGPT.";
     }
-    return { text, remoteId: turnId, ...(images.size ? { images: [...images.values()].slice(0, MAX_IMAGES) } : {}) };
+    const imagesComplete = unresolved.size === 0 && recoveredAttachments;
+    if (!imagesComplete) text += "\n\n[dots2api] The Dot generated an image, but it could not be downloaded; open the Dot thread in ChatGPT.";
+    return {
+      result: { text, remoteId: turnId, ...(images.size ? { images: [...images.values()].slice(0, MAX_IMAGES) } : {}) },
+      imageBytes,
+      imagesComplete,
+    };
   }
 }
 
@@ -392,7 +401,7 @@ export const dotsAdapter: ProviderAdapter = {
           context.onAccepted?.(turnId);
           const result = await collectTurn(connection, ownThread, turnId);
           await archiveThread(connection, ownThread);
-          return result;
+          return result.result;
         } catch (error) {
           // An uncertain turn may still be running remotely, and archiving it would discard work still producing an
           // answer; a turn that definitely failed leaves a thread nobody will ever use again.
@@ -420,7 +429,8 @@ export const dotsAdapter: ProviderAdapter = {
         threadBytes = 0;
         rotated = true;
       }
-      if (context.saveCredentials && !rotated && threadBytes > 0 && threadBytes + referenceBytes >= THREAD_IMAGE_BUDGET_BYTES) {
+      if (context.saveCredentials && !rotated && (credentials["threadImageAccounting"] === "incomplete" ||
+        (threadBytes > 0 && threadBytes + referenceBytes >= THREAD_IMAGE_BUDGET_BYTES))) {
         threadId = await provisionThread(connection, context.saveCredentials, credentials);
         threadBytes = 0;
         rotated = true;
@@ -434,23 +444,29 @@ export const dotsAdapter: ProviderAdapter = {
           context.onAccepted?.(turnId);
           const result = await collectTurn(connection, threadId, turnId);
           // Reference images stay on the thread too, so both count towards the next job's rotation decision.
-          const produced = (result.images?.reduce((sum, image) => sum + image.data.length, 0) ?? 0) + referenceBytes;
-          if (produced && context.saveCredentials) {
+          const produced = result.imageBytes + referenceBytes;
+          if ((produced || !result.imagesComplete) && context.saveCredentials) {
             threadBytes += produced;
             context.saveCredentials({
               ...credentials,
               threadId,
               ...(rotated ? { threadOrigin: "self" } : {}),
               threadImageBytes: String(threadBytes),
+              threadImageAccounting: result.imagesComplete ? "complete" : "incomplete",
             });
           }
-          return result;
+          return result.result;
         } catch (error) {
-          // A refused submission produced no remote work, so the prompt can be resubmitted safely: either the thread
-          // lost its agent, or Dot refused a turn on a thread that already holds image content over the limit.
-          const rebindable = error instanceof GatewayError && REBINDABLE.has(error.code);
-          const atImageLimit = (threadBytes > 0 || !referenceBytes) && threadAtImageLimit(error);
-          if (rotated || !context.saveCredentials || !(rebindable || atImageLimit)) throw error;
+          // Completion errors (including image-limit codes) say nothing about earlier side effects.
+          // Only the correlated RPC's explicit pre-execution rejection can authorize a single replay.
+          const rejectedBeforeExecution = error instanceof DotRpcError && error.beforeExecution;
+          if (!rejectedBeforeExecution) {
+            context.saveCredentials?.({
+              ...credentials, threadId, ...(rotated ? { threadOrigin: "self" } : {}),
+              threadImageBytes: String(threadBytes + referenceBytes), threadImageAccounting: "incomplete",
+            });
+          }
+          if (rotated || !context.saveCredentials || !rejectedBeforeExecution) throw error;
           rotated = true;
           submission.clear();
           threadId = await provisionThread(connection, context.saveCredentials, credentials);
