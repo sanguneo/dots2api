@@ -235,16 +235,14 @@ describe("Muse browser adapter", () => {
     expect((failure as Error).message).toContain("/gone");
   }, 90_000);
 
-  it("re-verifies the session and retries once when an attempt is uncertain", async () => {
+  it("does not replay an uncertain attempt after re-verifying authentication", async () => {
     // Given a signed-in account whose first submission loses its completion signal and whose page recovers afterwards.
     const context = { accountId: accountA, dataDir, signal: new AbortController().signal };
     await adapter.check({ cookieHeader: "hatch_sess=valid" }, context);
     // When the job is submitted.
-    const result = await adapter.run({}, "once", context);
-    // Then the retry delivers the answer and the record says a retry happened instead of hiding it.
-    expect(result.remoteId).toBe("synthetic-123");
-    expect(result.text).toContain("[dots2api]");
-    expect(result.text).toContain("retried once");
+    const result = adapter.run({}, "once", context);
+    // Then no second attempt turns the lost completion into a duplicate submission.
+    await expect(result).rejects.toMatchObject({ uncertain: true });
   }, 90_000);
 
   it("never returns partial text without a confirmed completion transition", async () => {
@@ -390,6 +388,7 @@ describe("Muse session self-heal", () => {
   let server: ReturnType<typeof Bun.serve>;
   let wakes = 0;
   let assigned = false;
+  const sessionCookies: string[] = [];
   const account = accountIdSchema.parse("33333333-3333-4333-8333-333333333333");
 
   beforeAll(async () => {
@@ -400,6 +399,7 @@ describe("Muse session self-heal", () => {
         const path = new URL(request.url).pathname;
         const authed = request.headers.get("cookie")?.includes("hatch_sess=valid") ?? false;
         if (path === "/api/session") {
+          sessionCookies.push(request.headers.get("cookie") ?? "");
           if (!authed) return Response.json({ status: "anonymous" });
           return Response.json(
             assigned ? { status: "assigned", vm_id: "vm-1", vm_state: "RUNNING" } : { status: "sleeping", vm_id: "vm-1", vm_state: "SLEEPING" },
@@ -425,11 +425,18 @@ describe("Muse session self-heal", () => {
     const captured: { credentials: Record<string, string> | null } = { credentials: null };
     const context = { accountId: account, dataDir, signal: new AbortController().signal, saveCredentials: (value: Record<string, string>) => { captured.credentials = value; } };
     // When checking the account.
-    const result = await heal.check({ cookieHeader: "hatch_sess=valid" }, context);
+    const result = await heal.check({ cookieHeader: "hatch_sess=valid", cookieJson: '{"hatch_vml":"old"}' }, context);
     // Then the VM was woken, the session became assigned, and the renewed cookie is stored back.
     expect(result.detail).toContain("assigned");
     expect(wakes).toBe(1);
     expect(captured.credentials?.cookieHeader).toContain("hatch_vml=renewed");
+    expect(captured.credentials?.cookieJson).toBeUndefined();
+    const repaired = captured.credentials;
+    if (!repaired) throw new Error("Expected renewed credentials");
+    sessionCookies.length = 0;
+    await heal.check(repaired, context);
+    expect(sessionCookies.length).toBeGreaterThan(0);
+    expect(sessionCookies.every((cookies) => cookies.includes("hatch_vml=renewed") && !cookies.includes("hatch_vml=old"))).toBe(true);
   }, 60_000);
 
   it("requires a reconnect when the workspace can never be assigned", async () => {

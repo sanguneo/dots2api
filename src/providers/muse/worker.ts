@@ -2,6 +2,7 @@ import { z } from "zod";
 import { accountIdSchema, GatewayError } from "../../contracts";
 import { MAX_IMAGES } from "../../images";
 import { createMuseAdapter } from "./engine";
+import { MAX_WORKER_LINE_BYTES } from "./io";
 
 const requestSchema = z.object({
   operation: z.enum(["check", "run"]),
@@ -18,7 +19,12 @@ const requestSchema = z.object({
   })).max(MAX_IMAGES).default([]),
 });
 const buffers: Buffer[] = [];
-for await (const chunk of process.stdin) buffers.push(Buffer.from(chunk));
+let inputBytes = 0;
+for await (const chunk of process.stdin) {
+  inputBytes += chunk.length;
+  if (inputBytes > MAX_WORKER_LINE_BYTES) throw new GatewayError("muse_worker", "Muse worker input exceeds its byte budget.", 413);
+  buffers.push(Buffer.from(chunk));
+}
 const controller = new AbortController();
 const abort = () => controller.abort();
 process.on("SIGTERM", abort);

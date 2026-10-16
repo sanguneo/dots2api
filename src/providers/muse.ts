@@ -5,13 +5,15 @@ import { z } from "zod";
 import { GatewayError } from "../contracts";
 import type { AdapterContext, CheckResult, Credentials, ProviderAdapter, RunImage, RunResult } from "../contracts";
 import { createMuseAdapter as createBrowserAdapter, sanitizeDiagnostics } from "./muse/engine";
+import { stderrTail, stopWorker, workerLines } from "./muse/io";
+import { MAX_IMAGE_BYTES, MAX_IMAGES } from "../images";
 
 const MAX_ATTEMPTS = 2;
 const WORKER_LOG_LIMIT = 256 * 1024;
 const WORKER_LOG_TAIL = 2_000;
-/** Failures a second attempt cannot fix: the request, the reference upload or the account configuration is wrong, not the session. */
-const FATAL_CODES = new Set(["muse_cancelled", "muse_credentials", "muse_prompt", "muse_attachment"]);
-const RETRY_NOTE = "The first Muse attempt did not confirm completion; the account session was re-verified and the run was retried once.";
+/** Only the engine can prove these failures happened before it tried to click Send. */
+const RETRYABLE_CODES = new Set(["muse_auth", "muse_unavailable", "muse_browser", "muse_send"]);
+const RETRY_NOTE = "The first Muse attempt failed before submission; the account session was re-verified and the run was retried once.";
 
 /**
  * Appends one bounded, credential-free line per worker run under `<dataDir>/logs`. A failure here must never surface as a
@@ -41,7 +43,7 @@ const eventSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("accepted"), remoteId: z.string().nullable() }),
   z.object({ type: z.literal("credentials"), credentials: z.record(z.string(), z.string()) }),
   z.object({ type: z.literal("checked"), detail: z.string() }),
-  z.object({ type: z.literal("completed"), text: z.string(), remoteId: z.string().nullable(), images: z.array(imageSchema).default([]) }),
+  z.object({ type: z.literal("completed"), text: z.string(), remoteId: z.string().nullable(), images: z.array(imageSchema).max(MAX_IMAGES).default([]) }),
   z.object({ type: z.literal("failed"), code: z.string(), message: z.string(), status: z.number(), uncertain: z.boolean() }),
 ]);
 type Terminal = Exclude<z.infer<typeof eventSchema>, { type: "accepted" } | { type: "credentials" }>;
@@ -102,28 +104,17 @@ async function callWorker(
     })]),
     stdout: "pipe", stderr: "pipe",
   });
-  let killTimer: ReturnType<typeof setTimeout> | undefined;
-  const abort = () => {
-    child.kill("SIGTERM");
-    killTimer = setTimeout(() => child.kill("SIGKILL"), 5_000);
-  };
+  let stopping: Promise<void> | undefined;
+  const terminate = () => stopping ??= stopWorker(child);
+  const abort = () => { void terminate(); };
   context.signal.addEventListener("abort", abort, { once: true });
   if (context.signal.aborted) abort();
   // Drain stderr privately: Chrome diagnostics must not leak paths or credentials to API clients.
-  const stderr = new Response(child.stderr).text();
-  const reader = child.stdout.getReader();
+  const stderr = stderrTail(child.stderr);
   let terminal: Terminal | undefined;
   let outcome = "the worker ended before confirming a result";
-  let buffer = "";
-  const decoder = new TextDecoder();
   try {
-    while (true) {
-      const chunk = await reader.read();
-      if (chunk.done) break;
-      buffer += decoder.decode(chunk.value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() ?? "";
-      for (const line of lines.filter(Boolean)) {
+    for await (const line of workerLines(child.stdout, context.signal)) {
         const event = eventSchema.parse(JSON.parse(line));
         switch (event.type) {
           case "accepted": context.onAccepted?.(event.remoteId); break;
@@ -132,11 +123,9 @@ async function callWorker(
           case "completed":
           case "failed": terminal = event; break;
         }
-      }
+      if (terminal) break;
     }
-    const code = await child.exited;
-    await stderr;
-    if (code !== 0 || !terminal) throw new GatewayError("muse_worker", "Muse browser worker ended before confirming a result.", 502, operation === "run");
+    if (!terminal) throw new GatewayError("muse_worker", "Muse browser worker ended before confirming a result.", 502, operation === "run");
     if (terminal.type === "failed") {
       outcome = `${terminal.code}: ${terminal.message}`;
       throw new GatewayError(terminal.code, terminal.message, terminal.status, terminal.uncertain);
@@ -148,12 +137,10 @@ async function callWorker(
     outcome = "the worker response could not be verified";
     throw new GatewayError("muse_worker", "Muse worker response could not be verified.", 502, operation === "run");
   } finally {
+    await terminate();
     context.signal.removeEventListener("abort", abort);
-    if (killTimer) clearTimeout(killTimer);
-    if (child.exitCode === null) child.kill("SIGTERM");
-    await child.exited;
-    const noise = (await stderr).trim();
-    reader.releaseLock();
+    await stderr.close();
+    const noise = stderr.text().trim();
     // Chrome diagnostics stay out of API responses, but a trimmed tail belongs in the operator's own log file.
     const tail = noise && outcome !== "completed" && outcome !== "checked"
       ? ` | chrome: ${sanitizeDiagnostics(noise.slice(-WORKER_LOG_TAIL))}`
@@ -162,13 +149,13 @@ async function callWorker(
   }
 }
 
-export function createMuseAdapter(site = "https://muse.ai", chatTimeout = 300_000): ProviderAdapter {
+export function createMuseAdapter(site = "https://muse.ai", chatTimeout = 300_000, execute = callWorker): ProviderAdapter {
   const definition = createBrowserAdapter(site, chatTimeout);
   const settings: WorkerSettings = { site, chatTimeout, pruneThreads: false };
   /** Re-verifies the account's session: the same work the console's Check button performs. */
   const reconnect = async (credentials: Credentials, context: AdapterContext): Promise<CheckResult> => {
     definition.validate(credentials);
-    const result = await callWorker("check", settings, credentials, "", context);
+    const result = await execute("check", settings, credentials, "", context);
     if (result.type !== "checked") throw new GatewayError("muse_worker", "Unexpected Muse check result.", 502);
     return { detail: result.detail };
   };
@@ -178,8 +165,13 @@ export function createMuseAdapter(site = "https://muse.ai", chatTimeout = 300_00
    */
   const runSettings = (context: AdapterContext): WorkerSettings => ({ ...settings, pruneThreads: context.keepContext === false });
   const runOnce = async (credentials: Credentials, prompt: string, context: AdapterContext): Promise<RunResult> => {
-    const result = await callWorker("run", runSettings(context), credentials, prompt, context);
+    const result = await execute("run", runSettings(context), credentials, prompt, context);
     if (result.type !== "completed") throw new GatewayError("muse_worker", "Unexpected Muse job result.", 502, true);
+    let bytes = 0;
+    for (const image of result.images) {
+      bytes += Buffer.byteLength(image.dataB64, "base64");
+      if (bytes > MAX_IMAGE_BYTES) throw new GatewayError("muse_worker", "Muse worker exceeded the image result budget.", 502, true);
+    }
     const images: RunImage[] = result.images.map((image) => ({
       mime: image.mime,
       data: new Uint8Array(Buffer.from(image.dataB64, "base64")),
@@ -193,25 +185,33 @@ export function createMuseAdapter(site = "https://muse.ai", chatTimeout = 300_00
     info: definition.info,
     validate: definition.validate,
     check: reconnect,
-    /**
-     * Recovery around a failed attempt. Each attempt is a new worker process, a new browser and a new thread, so a dead
-     * browser or a lapsed session is exactly what a second attempt needs. The session is re-verified first, and only a
-     * session that answers its own check is retried: without that proof the retry would fail for the same reason and the
-     * original failure is reported unchanged. A submission cannot be cancelled remotely, so the abandoned thread may still
-     * finish on Muse; the job keeps only the delivered result and says that a retry happened.
-     */
+    /** Reconnection repairs authentication, never evidence that an earlier submission was not accepted. */
     async run(credentials, prompt, context) {
       definition.validate(credentials);
+      let currentCredentials = credentials;
+      let accepted = false;
+      const attemptContext: AdapterContext = {
+        ...context,
+        onAccepted: (remoteId) => {
+          accepted = true;
+          context.onAccepted?.(remoteId);
+        },
+        saveCredentials: (repaired) => {
+          currentCredentials = repaired;
+          context.saveCredentials?.(repaired);
+        },
+      };
       let lastError: unknown;
       for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
         try {
-          const result = await runOnce(credentials, prompt, context);
+          const result = await runOnce(currentCredentials, prompt, attemptContext);
           return attempt === 1 ? result : { ...result, text: `${result.text}\n\n[dots2api] ${RETRY_NOTE}`.trim() };
         } catch (error) {
           lastError = error;
-          if (!(error instanceof GatewayError) || context.signal.aborted || FATAL_CODES.has(error.code) || attempt === MAX_ATTEMPTS) break;
+          if (!(error instanceof GatewayError) || error.uncertain || accepted || context.signal.aborted ||
+            !RETRYABLE_CODES.has(error.code) || attempt === MAX_ATTEMPTS) break;
           try {
-            await reconnect(credentials, context);
+            await reconnect(currentCredentials, attemptContext);
           } catch {
             break;
           }

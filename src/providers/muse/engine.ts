@@ -204,21 +204,43 @@ function attachmentsInPage(): Attachment[] {
 }
 
 /** Runs inside the page: the bytes of one media URL as base64, so `blob:` and `data:` sources work too. */
-async function mediaBytesInPage(src: string): Promise<{ readonly ok: boolean; readonly mime?: string; readonly b64?: string; readonly err?: string }> {
+export async function mediaBytesInPage({ src, limit }: { readonly src: string; readonly limit: number }): Promise<{ readonly ok: boolean; readonly mime?: string; readonly b64?: string; readonly bytes?: number; readonly err?: string }> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 30_000);
   try {
-    const response = await fetch(src);
+    const response = await fetch(src, { signal: controller.signal });
     if (!response.ok) return { ok: false, err: `media-http-${response.status}` };
-    const blob = await response.blob();
+    if (Number(response.headers.get("content-length")) > limit) {
+      await response.body?.cancel();
+      return { ok: false, err: "media-too-large" };
+    }
+    if (!response.body) return { ok: false, err: "media-no-body" };
+    const input = response.body.getReader();
+    const chunks: Uint8Array<ArrayBuffer>[] = [];
+    let received = 0;
+    try {
+      while (true) {
+        const { value, done } = await input.read();
+        if (done) break;
+        received += value.byteLength;
+        if (received > limit) {
+          await input.cancel();
+          return { ok: false, err: "media-too-large" };
+        }
+        chunks.push(new Uint8Array(value));
+      }
+    } finally { input.releaseLock(); }
+    const blob = new Blob(chunks, { type: response.headers.get("content-type") ?? "" });
     const dataUrl = await new Promise<string>((resolve, reject) => {
       const reader = new FileReader();
       reader.onload = () => resolve(String(reader.result));
       reader.onerror = () => reject(reader.error);
       reader.readAsDataURL(blob);
     });
-    return { ok: true, mime: blob.type || "", b64: dataUrl.slice(dataUrl.indexOf(",") + 1) };
+    return { ok: true, mime: blob.type || "", b64: dataUrl.slice(dataUrl.indexOf(",") + 1), bytes: received };
   } catch (error) {
     return { ok: false, err: String(error) };
-  }
+  } finally { clearTimeout(timer); }
 }
 
 /**
@@ -277,7 +299,8 @@ export function createMuseAdapter(site = "https://muse.ai", chatTimeout = CHAT_T
     if (renewed.length === 0) return;
     // Chrome drops session cookies when the persistent context closes; a future expiry keeps them on disk.
     await browser.addCookies(renewed.map((cookie) => ({ ...cookie, expires: Math.floor(Date.now() / 1000) + 86_400 })));
-    context.saveCredentials?.({ ...credentials, cookieHeader: renewed.map((cookie) => `${cookie.name}=${cookie.value}`).join("; ") });
+    const { cookieJson: _imported, ...canonical } = credentials;
+    context.saveCredentials?.({ ...canonical, cookieHeader: renewed.map((cookie) => `${cookie.name}=${cookie.value}`).join("; ") });
   }
 
   async function generatedImages(page: Page, baseline: ReadonlySet<string>): Promise<RunImage[]> {
@@ -313,9 +336,12 @@ export function createMuseAdapter(site = "https://muse.ai", chatTimeout = CHAT_T
       fresh = await collect();
     }
     const images: RunImage[] = [];
+    let remaining = 32 * 1024 * 1024;
     for (const attachment of fresh.slice(0, MAX_IMAGES)) {
-      const bytes = await page.evaluate(mediaBytesInPage, attachment.src);
+      const bytes = await page.evaluate(mediaBytesInPage, { src: attachment.src, limit: remaining });
+      if (bytes.err === "media-too-large") throw new GatewayError("muse_image_limit", "Muse exceeded the 32 MiB image result budget.", 502, true);
       if (!bytes.ok || !bytes.b64) continue;
+      remaining -= bytes.bytes ?? 0;
       images.push({
         mime: attachmentMime(bytes.mime),
         data: new Uint8Array(Buffer.from(bytes.b64, "base64")),
