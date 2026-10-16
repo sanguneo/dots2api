@@ -1,7 +1,23 @@
 import { z } from "zod";
 import { GatewayError } from "./contracts";
 
-const jsonObject = z.record(z.string(), z.json());
+function isJsonValue(value: unknown, ancestors = new Set<object>()): boolean {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (typeof value !== "object" || ancestors.has(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  if (!Array.isArray(value) && prototype !== Object.prototype && prototype !== null) return false;
+  ancestors.add(value);
+  const valid = Object.values(value).every((item) => isJsonValue(item, ancestors));
+  ancestors.delete(value);
+  return valid;
+}
+
+// Validate without rebuilding objects: record/json normalization drops own __proto__ keys.
+// JSON Schema's unconstrained additionalProperties already permits every JSON value.
+const jsonObject = z.unknown().refine((value) =>
+  value !== null && typeof value === "object" && !Array.isArray(value) && isJsonValue(value),
+).meta({ type: "object", additionalProperties: {} });
 const toolName = z.string().regex(/^[a-zA-Z0-9_-]{1,64}$/);
 export const textContentSchema = z.union([
   z.string(),
@@ -170,6 +186,16 @@ function invalidResponse(message: string): never {
  */
 export function parseRemoteAssistant(text: string, bridge: PreparedChatBridge): BridgeCompletion {
   if (bridge.mode === "text") return { message: { role: "assistant", content: text }, finish_reason: "stop" };
+  // Inspect number tokens before JSON.parse can round them; consume whole strings so
+  // numeric text and escaped quotes in strings are never mistaken for arguments.
+  // This does not require JSON.parse reviver source support from the runtime.
+  for (const token of text.matchAll(/"(?:[^"\\]|\\[\s\S])*"|(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)/g)) {
+    if (token[1] === undefined) continue;
+    const number = Number(token[1]);
+    if (Number.isInteger(number) && !Number.isSafeInteger(number)) {
+      invalidResponse("Remote tool reply contained an unsafe integer; no retry was submitted.");
+    }
+  }
   let value: unknown;
   try {
     value = JSON.parse(text);

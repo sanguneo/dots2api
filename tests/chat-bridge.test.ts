@@ -33,6 +33,8 @@ const request = { messages, tools };
 const readCall = { name: "read", arguments: { path: "a.ts", offset: null } };
 const envelope = (calls: readonly unknown[] = [], content: string | null = null) =>
   JSON.stringify({ protocol: BRIDGE_PROTOCOL, content, tool_calls: calls });
+const rawArgumentsEnvelope = (argumentsJson: string) =>
+  `{"protocol":"${BRIDGE_PROTOCOL}","content":null,"tool_calls":[{"name":"read","arguments":${argumentsJson}}]}`;
 
 describe("bridge request boundary", () => {
   test("preserves composed OmO schemas and transcript data in the envelope", () => {
@@ -108,6 +110,46 @@ describe("bridge request boundary", () => {
     // Then no minimal-schema restriction rejects a valid client tool.
     expect(parsed.tools[0]?.function).toEqual({ name: "status", strict: false });
   });
+
+  test("preserves own __proto__ schema keys at every nesting without prototype mutation", () => {
+    const parameters = JSON.parse(`{
+      "__proto__":{"bridgePolluted":true},
+      "type":"object",
+      "properties":{"__proto__":{"type":"string"}},
+      "anyOf":[{"properties":{"nested":{"__proto__":{"type":"number"}}}}],
+      "constructor":{"prototype":{"bridgePolluted":true}}
+    }`);
+    const bridge = prepareChatBridge({
+      messages, tools: [{ type: "function", function: { name: "read", parameters } }],
+    });
+    const preserved = JSON.parse(bridge.prompt).tools[0].function.parameters;
+    expect(JSON.stringify(preserved)).toBe(JSON.stringify(parameters));
+    for (const object of [parameters, preserved, preserved.properties, preserved.anyOf[0].properties.nested]) {
+      expect(Object.hasOwn(object, "__proto__")).toBe(true);
+      expect(Object.getPrototypeOf(object)).toBe(Object.prototype);
+    }
+    expect(Object.hasOwn(Object.prototype, "bridgePolluted")).toBe(false);
+  });
+
+  test.each([
+    { value: undefined },
+    { value: NaN },
+    { value: new Date(0) },
+    { value: () => "not JSON" },
+  ])("rejects non-JSON schema values rather than serializing them away: %j", (parameters) => {
+    expect(() => prepareChatBridge({
+      messages, tools: [{ type: "function", function: { name: "read", parameters } }],
+    })).toThrow(z.ZodError);
+  });
+
+  test("validates values inside own __proto__ schema keys", () => {
+    const parameters = JSON.parse('{"__proto__":null}');
+    parameters.__proto__ = undefined;
+    expect(() => prepareChatBridge({
+      messages, tools: [{ type: "function", function: { name: "read", parameters } }],
+    })).toThrow(z.ZodError);
+    expect(Object.getPrototypeOf(parameters)).toBe(Object.prototype);
+  });
 });
 
 describe("remote assistant boundary", () => {
@@ -162,6 +204,52 @@ describe("remote assistant boundary", () => {
       ...messages, result.message,
       ...result.message.tool_calls.map((call) => ({ role: "tool", tool_call_id: call.id, content: "{}" })),
     ]);
+  });
+
+  test.each([
+    "9007199254740993", "-9007199254740993",
+    "9007199254740992", "-9007199254740992",
+    "9.007199254740993e15", "-9.007199254740993e15",
+    "90071992547409930e-1", "9007199254740993.0", "1e20", "-1e20",
+  ])("rejects unsafe integer argument tokens before they can be forwarded: %s", (token) => {
+    const text = rawArgumentsEnvelope(`{"nested":[{"__proto__":{"id":${token}}}]}`);
+    expect(() => parseRemoteAssistant(text, prepareChatBridge(request))).toThrow(
+      expect.objectContaining({ code: "invalid_tool_response", status: 502 }),
+    );
+  });
+
+  test("preserves safe integers, normal fractions, and numeric text with escaped quotes", () => {
+    const argumentsJson = String.raw`{
+      "max":9007199254740991,"min":-9007199254740991,
+      "fractions":[0.1,-1.25,1e-3,1e-20],
+      "text":"9007199254740993, \"-9007199254740993\", \\9.007199254740993e15",
+      "empty":{},"list":[],"flag":true,"none":null
+    }`;
+    const result = parseRemoteAssistant(rawArgumentsEnvelope(argumentsJson), prepareChatBridge(request));
+    if (result.finish_reason !== "tool_calls") throw new Error("Expected tool calls");
+    const call = result.message.tool_calls[0];
+    if (!call) throw new Error("Expected the returned call");
+    expect(JSON.parse(call.function.arguments)).toEqual(JSON.parse(argumentsJson));
+  });
+
+  test("retains nested own __proto__ arguments without polluting any prototype", () => {
+    const argumentsJson = `{
+      "__proto__":{"bridgePolluted":true},
+      "nested":{"__proto__":{"value":"kept"}},
+      "items":[{"__proto__":null}],
+      "constructor":{"prototype":{"bridgePolluted":true}}
+    }`;
+    const result = parseRemoteAssistant(rawArgumentsEnvelope(argumentsJson), prepareChatBridge(request));
+    if (result.finish_reason !== "tool_calls") throw new Error("Expected tool calls");
+    const call = result.message.tool_calls[0];
+    if (!call) throw new Error("Expected the returned call");
+    const args = JSON.parse(call.function.arguments);
+    expect(JSON.stringify(args)).toBe(JSON.stringify(JSON.parse(argumentsJson)));
+    for (const object of [args, args.nested, args.items[0]]) {
+      expect(Object.hasOwn(object, "__proto__")).toBe(true);
+      expect(Object.getPrototypeOf(object)).toBe(Object.prototype);
+    }
+    expect(Object.hasOwn(Object.prototype, "bridgePolluted")).toBe(false);
   });
 
   test.each([
