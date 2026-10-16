@@ -507,7 +507,7 @@ test("run replaces a thread that is already at Dot's image ceiling before submit
   expect(methods).toEqual(["initialize", "initialized", "thread/read", "thread/resume", "thread/start", "turn/start"]);
   expect(saved[0]).toMatchObject({ threadId: "fresh-thread", threadOrigin: "self", threadImageBytes: "0" });
   expect(saved).toHaveLength(2);
-  expect(saved[1]).toMatchObject({ threadId: "fresh-thread", threadImageBytes: String(Buffer.from(PNG_BASE64, "base64").length) });
+  expect(saved[1]).toMatchObject({ threadId: "fresh-thread", threadOrigin: "self", threadImageBytes: String(Buffer.from(PNG_BASE64, "base64").length) });
 });
 
 test("run archives the thread it replaces when this gateway created that thread", async () => {
@@ -667,6 +667,79 @@ test("run keeps the thread when the refused request carried its own reference im
   });
   // Then the failure is reported instead of rotating a thread the request would fill again.
   expect(methods).not.toContain("thread/start");
+});
+
+test("run replaces a thread before submitting when a reference image would push it over Dot's image ceiling", async () => {
+  const methods: string[] = [];
+  const saved: Credentials[] = [];
+  const reference = new Uint8Array(Buffer.from(PNG_BASE64, "base64"));
+  // Given a thread just under the 8 MiB ceiling and a reference image that pushes the combined content over it.
+  await withServer((peer, request) => {
+    methods.push(request.method);
+    if (handshake(peer, request)) return;
+    if (request.method === "thread/start") {
+      reply(peer, request, { thread: { id: "fresh-thread" } });
+      return;
+    }
+    if (request.method !== "turn/start") return;
+    expect(request.params.threadId).toBe("fresh-thread");
+    peer.send(JSON.stringify({ method: "turn/completed", params: {
+      threadId: "fresh-thread", turn: { id: "turn-1", status: "completed", items: [{ id: "answer", type: "agentMessage", text: "Edited" }] },
+    } }));
+    reply(peer, request, { turn: { id: "turn-1", status: "inProgress" } });
+  }, async (credentials) => {
+    const prior = 8 * 1024 * 1024 - reference.length + 1;
+    const result = await dotsAdapter.run({ ...credentials, threadImageBytes: String(prior) }, "edit", {
+      ...context,
+      referenceImages: [{ mime: "image/png", data: reference }],
+      saveCredentials: (repaired) => { saved.push(repaired); },
+    });
+    expect(result).toEqual({ text: "Edited", remoteId: "turn-1" });
+  });
+  expect(methods).toEqual(["initialize", "initialized", "thread/read", "thread/resume", "thread/start", "turn/start"]);
+  expect(saved).toHaveLength(2);
+  expect(saved[1]).toMatchObject({ threadId: "fresh-thread", threadOrigin: "self", threadImageBytes: String(reference.length) });
+});
+
+test("run rotates the thread and retries when Dot refuses a reference-image turn on a thread that already holds images", async () => {
+  const methods: string[] = [];
+  const saved: Credentials[] = [];
+  const reference = new Uint8Array(Buffer.from(PNG_BASE64, "base64"));
+  // Given a thread that already holds images below the proactive budget, and a reference-image turn Dot refuses on it.
+  await withServer((peer, request) => {
+    methods.push(request.method);
+    if (handshake(peer, request)) return;
+    if (request.method === "thread/start") {
+      reply(peer, request, { thread: { id: "fresh-thread" } });
+      return;
+    }
+    if (request.method !== "turn/start") return;
+    if (request.params.threadId === "dot-thread") {
+      peer.send(JSON.stringify({ method: "turn/completed", params: {
+        threadId: "dot-thread",
+        turn: { id: "turn-1", status: "failed", items: [], error: { message: JSON.stringify({ error: {
+          code: "image_request_too_large", message: "The combined resolved image content is too large.",
+        } }) } },
+      } }));
+      reply(peer, request, { turn: { id: "turn-1", status: "failed" } });
+      return;
+    }
+    expect(request.params.threadId).toBe("fresh-thread");
+    peer.send(JSON.stringify({ method: "turn/completed", params: {
+      threadId: "fresh-thread", turn: { id: "turn-2", status: "completed", items: [{ id: "answer", type: "agentMessage", text: "Edited" }] },
+    } }));
+    reply(peer, request, { turn: { id: "turn-2", status: "inProgress" } });
+  }, async (credentials) => {
+    const result = await dotsAdapter.run({ ...credentials, threadImageBytes: "1024" }, "edit", {
+      ...context,
+      referenceImages: [{ mime: "image/png", data: reference }],
+      saveCredentials: (repaired) => { saved.push(repaired); },
+    });
+    expect(result).toEqual({ text: "Edited", remoteId: "turn-2" });
+  });
+  expect(methods).toEqual(["initialize", "initialized", "thread/read", "thread/resume", "turn/start", "thread/start", "turn/start"]);
+  expect(saved).toHaveLength(2);
+  expect(saved[1]).toMatchObject({ threadId: "fresh-thread", threadOrigin: "self", threadImageBytes: String(reference.length) });
 });
 
 test("run records the image content a turn leaves on the thread", async () => {

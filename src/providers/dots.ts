@@ -405,6 +405,7 @@ export const dotsAdapter: ProviderAdapter = {
       let rotated = false;
       // Tracked per thread, not per account: a replacement starts empty and the stored count follows it.
       let threadBytes = threadImageBytes(credentials);
+      const referenceBytes = context.referenceImages?.reduce((sum, image) => sum + image.data.length, 0) ?? 0;
       try {
         await existingThread(connection, threadId, credentials["threadOrigin"] === "self");
         const resumed = threadSchema.safeParse(await connection.request("thread/resume", { threadId }));
@@ -419,7 +420,7 @@ export const dotsAdapter: ProviderAdapter = {
         threadBytes = 0;
         rotated = true;
       }
-      if (context.saveCredentials && !rotated && threadBytes >= THREAD_IMAGE_BUDGET_BYTES) {
+      if (context.saveCredentials && !rotated && threadBytes > 0 && threadBytes + referenceBytes >= THREAD_IMAGE_BUDGET_BYTES) {
         threadId = await provisionThread(connection, context.saveCredentials, credentials);
         threadBytes = 0;
         rotated = true;
@@ -433,18 +434,22 @@ export const dotsAdapter: ProviderAdapter = {
           context.onAccepted?.(turnId);
           const result = await collectTurn(connection, threadId, turnId);
           // Reference images stay on the thread too, so both count towards the next job's rotation decision.
-          const produced = (result.images?.reduce((sum, image) => sum + image.data.length, 0) ?? 0)
-            + (context.referenceImages?.reduce((sum, image) => sum + image.data.length, 0) ?? 0);
+          const produced = (result.images?.reduce((sum, image) => sum + image.data.length, 0) ?? 0) + referenceBytes;
           if (produced && context.saveCredentials) {
             threadBytes += produced;
-            context.saveCredentials({ ...credentials, threadId, threadImageBytes: String(threadBytes) });
+            context.saveCredentials({
+              ...credentials,
+              threadId,
+              ...(rotated ? { threadOrigin: "self" } : {}),
+              threadImageBytes: String(threadBytes),
+            });
           }
           return result;
         } catch (error) {
           // A refused submission produced no remote work, so the prompt can be resubmitted safely: either the thread
-          // lost its agent, or Dot refused a text-only turn because the thread's own image content is over the limit.
+          // lost its agent, or Dot refused a turn on a thread that already holds image content over the limit.
           const rebindable = error instanceof GatewayError && REBINDABLE.has(error.code);
-          const atImageLimit = !context.referenceImages?.length && threadAtImageLimit(error);
+          const atImageLimit = (threadBytes > 0 || !referenceBytes) && threadAtImageLimit(error);
           if (rotated || !context.saveCredentials || !(rebindable || atImageLimit)) throw error;
           rotated = true;
           submission.clear();
