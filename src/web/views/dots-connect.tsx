@@ -1,11 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import type { Account } from "../../contracts";
 import { Drawer } from "../components/dialog";
-import { DotAddressHint } from "../components/domain";
 import { Button, CodeBlock, Field, Notice } from "../components/ui";
 import { cancelDotsLogin, completeDotsLogin, startDotsLogin, toApiError } from "../lib/api";
 import type { DotsDevice } from "../lib/api";
-import { parseThreadId } from "../lib/format";
 import { gateway } from "../lib/store";
 import { notify } from "../lib/toast";
 
@@ -21,9 +19,7 @@ function wait(ms: number, signal: AbortSignal): Promise<void> {
 
 export function DotsConnectDrawer({ onClose }: { readonly onClose: () => void }) {
   const [label, setLabel] = useState("");
-  const [thread, setThread] = useState("");
   const [labelError, setLabelError] = useState<string | null>(null);
-  const [threadError, setThreadError] = useState<string | null>(null);
   const [account, setAccount] = useState<Account | null>(null);
   const [device, setDevice] = useState<DotsDevice | null>(null);
   const [busy, setBusy] = useState(false);
@@ -33,14 +29,13 @@ export function DotsConnectDrawer({ onClose }: { readonly onClose: () => void })
   useEffect(() => {
     if (!device || !account) return;
     const controller = new AbortController();
-    const threadId = parseThreadId(thread);
     void (async () => {
       let delay = Math.max(MIN_POLL_MS, device.pollIntervalMs);
       while (!controller.signal.aborted) {
         await wait(delay, controller.signal);
         if (controller.signal.aborted) return;
         try {
-          const result = await completeDotsLogin(account.id, threadId);
+          const result = await completeDotsLogin(account.id);
           if (controller.signal.aborted) return;
           if (result.status === "pending") {
             delay = Math.max(MIN_POLL_MS, result.retryAfterMs);
@@ -53,7 +48,7 @@ export function DotsConnectDrawer({ onClose }: { readonly onClose: () => void })
             notify("ok", `‘${result.account.label}’ 계정을 연결했습니다`, result.account.detail || null);
             onClose();
           } else {
-            setError(result.account.detail || "Dot 연결을 확인하지 못했습니다. Dot 주소를 확인한 뒤 다시 시작하세요.");
+            setError(result.account.detail || "Dot 연결을 확인하지 못했습니다. 이 ChatGPT 계정에 Dot이 있는지 확인한 뒤 다시 시작하세요.");
           }
           return;
         } catch (failure) {
@@ -70,12 +65,9 @@ export function DotsConnectDrawer({ onClose }: { readonly onClose: () => void })
 
   async function start(): Promise<void> {
     const trimmedLabel = label.trim();
-    const threadId = parseThreadId(thread);
     const nextLabelError = !trimmedLabel ? "라벨을 입력하세요." : trimmedLabel.length > LABEL_MAX ? `${LABEL_MAX}자 이하로 입력하세요.` : null;
-    const nextThreadError = threadId ? null : "Dot을 연 상태의 주소를 붙여넣어 주세요. 예: https://chatgpt.com/dots/…";
     setLabelError(nextLabelError);
-    setThreadError(nextThreadError);
-    if (nextLabelError || nextThreadError) return;
+    if (nextLabelError) return;
     setBusy(true);
     setError(null);
     try {
@@ -107,7 +99,7 @@ export function DotsConnectDrawer({ onClose }: { readonly onClose: () => void })
   return (
     <Drawer
       title="Dot 계정 연결"
-      subtitle="추가 · 기기 인증 · Dot 선택을 한 번에 진행합니다."
+      subtitle="추가와 기기 인증을 한 번에 진행합니다."
       busy={busy}
       onClose={() => void close()}
       footer={
@@ -128,8 +120,8 @@ export function DotsConnectDrawer({ onClose }: { readonly onClose: () => void })
       }
     >
       <form className="form" noValidate autoComplete="off" onSubmit={(event) => { event.preventDefault(); if (!waiting && !busy) void start(); }}>
-        <Notice title="기존 Dot에 연결">
-          ChatGPT 계정으로 기기 인증한 뒤 이 서버가 기존 Dot을 사용합니다. 새 Astra 대화를 만들지 않으며, 서버가 Aeon Dot인지 확인합니다.
+        <Notice title="내 Dot에 연결">
+          ChatGPT 계정으로 기기 인증하면 이 서버가 그 계정의 Dot과 대화합니다. 요청은 ChatGPT의 Dot 대화에 그대로 남습니다.
           기기 인증이 계정 설정에서 허용되어 있어야 합니다.
         </Notice>
         <Field label="라벨" mark="required" error={labelError} hint="목록과 작업 기록에서 이 계정을 구분하는 이름입니다.">
@@ -145,11 +137,6 @@ export function DotsConnectDrawer({ onClose }: { readonly onClose: () => void })
               disabled={account !== null}
               onChange={(event) => setLabel(event.target.value)}
             />
-          )}
-        </Field>
-        <Field label="기존 Dot 주소 또는 ID" mark="required" error={threadError} hint={<DotAddressHint />}>
-          {(control) => (
-            <input {...control} className="input" value={thread} placeholder="https://chatgpt.com/dots/…" disabled={waiting} onChange={(event) => setThread(event.target.value)} autoComplete="off" />
           )}
         </Field>
         {device ? (

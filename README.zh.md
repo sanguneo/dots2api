@@ -26,11 +26,11 @@
 
 - **OpenAI 风格的聊天。** 用 `dots-agent` 调用 `POST /v1/chat/completions`；`tools` 和 `tool_choice` 通过基于提示词的 JSON 桥接工作，返回的调用由你的客户端（例如 OmO）执行。
 - **图像生成。** 用 `dots-image` 或 `muse-image` 调用 `POST /v1/images/generations`，接受 `prompt`、`n`（1–4）、`size`、`quality` 和 `response_format`（`b64_json` 或 `url`）；文件只接受 PNG、JPEG 或 WebP，按文件签名判断，每张不超过 32 MiB。`dots-image` 在 Dot 上运行，`muse-image` 通过你自己的 muse.ai 账号在隔离的 Chrome 配置文件中生成（需要 Node.js 22 或更高版本与 Chromium），通常返回 WebP。
-- **提供商与账号开关。** 每个账号都有自己的启用开关，每个提供商（Dots、Muse）还有一个总开关，在不改动已存凭据的情况下阻止新任务路由到它。每个账号还有一个**保持对话**开关，默认开启：开启时 Dots 账号一直使用同一个对话；关闭时每个任务都在新对话中运行并在结束后归档，因此一个任务的提示词和图像不会带到下一个任务。
-- **自愈。** 丢失代理的 Dot 线程账号会自动重新绑定到新线程；muse.ai 会话过期或云端工作 VM 休眠的账号会在运行前续签会话并唤醒 VM，因此能在远端重置或服务器重启后自行恢复正常。任务以未确认状态结束时，网关会先重新检查该账号的会话再决定是否把它移出轮换，检查通过就继续可用；Muse 任务只在这样重新检查后重试一次，并在任务文本中注明（第一次尝试仍可能在 Muse 上完成）。
+- **提供商与账号开关。** 每个账号都有自己的启用开关，每个提供商（Dots、Muse）还有一个总开关，在不改动已存凭据的情况下阻止新任务路由到它。Muse 账号还有一个**保持对话**开关（见下文）；Dots 账号始终在 Dot 自己的对话中与 Dot 交流。
+- **自愈。** Dots 账号每次任务都会重新查找该账号当前的主 Dot，因此 Dot 换到新对话后也无需重新连接；muse.ai 会话过期或云端工作 VM 休眠的账号会在运行前续签会话并唤醒 VM，因此能在远端重置或服务器重启后自行恢复正常。任务以未确认状态结束时，网关会先重新检查该账号的会话再决定是否把它移出轮换，检查通过就继续可用；Muse 任务只在这样重新检查后重试一次，并在任务文本中注明（第一次尝试仍可能在 Muse 上完成）。
 - **Web 控制台。** 运行在回环地址上的 React 控制台，包含账号、任务、带图像预览的任务详情，以及显示本地 API 密钥和 OmO `models.json` 示例的 API 指南。
 - **设备码登录。** 在 `auth.openai.com/codex/device` 批准，可以在另一台电脑上完成；令牌只保存在服务器上，使用 AES-256-GCM 加密，并在到期前 60 秒刷新。
-- **每个账号同时只执行一个任务，且按顺序执行。** 忙碌账号收到的新任务会以 `queued` 接受，并在当前任务结束后开始，因此并发请求不会共用同一个 Dot 线程；登录或检查占用账号时返回 `409 account_busy`，队列已满返回 `429 queue_full`，没有可用账号返回 `503`。
+- **每个账号同时只执行一个任务，且按顺序执行。** 忙碌账号收到的新任务会以 `queued` 接受，并在当前任务结束后开始，因此并发请求不会在同一个 Dot 对话中交错；登录或检查占用账号时返回 `409 account_busy`，队列已满返回 `429 queue_full`，没有可用账号返回 `503`。
 - **仅限回环地址。** 服务器只绑定 `127.0.0.1`，`/v1` 端点需要 Bearer API 密钥。
 
 ## 安装
@@ -76,9 +76,9 @@ ssh -N -L 3010:127.0.0.1:3010 user@server
 
 ### 连接 Dot
 
-1. 在控制台打开 **账号 → 添加账号**，输入标签和**现有的 Dot**（访问 `https://chatgpt.com/dots`，打开想用的 Dot，然后粘贴地址栏中的地址 `https://chatgpt.com/dots/<ID>`；只填 ID 也可以），然后点击**开始**。这一步会创建账号并同时开始设备登录。
+1. 在控制台打开 **账号 → 添加账号**，输入标签，然后点击**开始**。无需填写 Dot 地址。这一步会创建账号并同时开始设备登录。
 2. 打开显示的 ChatGPT 链接（`auth.openai.com/codex/device`）并批准一次性代码。浏览器可以在与服务器不同的电脑上。控制台会轮询批准结果并自动完成连接，无需再点击。
-3. dots2api 从不创建线程，除非线程报告 `threadSource: aeon`，否则拒绝连接。如果在连接成功前取消，创建了一半的账号会被删除。
+3. dots2api 会连接该 ChatGPT 账号的主 Dot；账号没有 Dot 时拒绝连接。请求、参考图和回复会保留在 ChatGPT 的 Dot 对话中。如果在连接成功前取消，创建了一半的账号会被删除。
 
 令牌绝不会返回给浏览器。如果刷新被撤销或结果未知，请重新登录。**不要与 Codex CLI 或其他工具共用同一个 refresh token。** 已有账号仍可通过其**登录**按钮重新登录。完整约定见 [`src/dots-auth/README.md`](src/dots-auth/README.md)。
 
@@ -130,7 +130,7 @@ curl -sS http://127.0.0.1:3010/v1/images/generations \
 
 - 请求：`prompt`（必填）、`n`（1–4，默认 1）、`size`（`auto`、`1024x1024`、`1536x1024`、`1024x1536`）、`quality`（`auto`、`low`、`medium`、`high`）、`response_format`（默认 `b64_json`，或 `url`）。其他字段会返回 400。
 - 响应：OpenAI 格式的 `data[]`（`b64_json` 或 `url`，以及 Dot 实际使用的 `revised_prompt`）、`output_format: "png"` 和真实的 `size`。`url` 指向 `GET /api/jobs/:id/images/0`，并且**需要 API 密钥**。
-- 生成一张图大约需要一分钟，`n` 张图在同一个 Dot 线程中依次生成。如果最后几张失败，已完成的图像会照常返回，`X-Dots2api-Images-Requested` 和 `X-Dots2api-Images-Returned` 响应头会说明数量。
+- 生成一张图大约需要一分钟，`n` 张图在同一个 Dot 对话中依次生成。如果最后几张失败，已完成的图像会照常返回，`X-Dots2api-Images-Requested` 和 `X-Dots2api-Images-Returned` 响应头会说明数量。
 - 参考图像编辑使用 `dots-image` 或 `muse-image`，通过 multipart 上传调用 `POST /v1/images/edits`：
 
 ```bash
@@ -152,7 +152,7 @@ curl -sS http://127.0.0.1:3010/v1/images/edits \
 
 1. 客户端带着 Bearer 密钥调用 `/v1/...`，或者控制台从同一来源调用 `/api/...`。
 2. 网关选择一个已启用且当前没有任务在运行的账号；若账号忙碌，则把新任务排队，等当前任务结束后执行。
-3. Dots provider 连接 `wss://codex-cloud-backend.chatgpt.com`，在你现有的 Aeon 线程上使用 Codex 客户端所用的 app-server JSON-RPC。
+3. Dots provider 向 ChatGPT 网页版所用的同一个 Dot 对话（`/backend-api/messaging`，参考图以对话文件上传）发送消息，等待 Dot 完成（其在 `wss://codex-cloud-backend.chatgpt.com` 上的线程状态变为 `idle`），然后取回回复和附带的图片。
 4. 任务及其状态保存在 SQLite 中。
 5. 聊天输出以 OpenAI JSON 或 SSE 返回；图像会按文件签名检查，并保存到 `images/<job id>/`。
 6. 超时或重启后远端结果未知时，任务标记为 `unknown`，绝不会自动重发。

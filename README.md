@@ -26,11 +26,11 @@
 
 - **OpenAI-style chat.** `POST /v1/chat/completions` with `dots-agent`; `tools` and `tool_choice` work through a prompt-based JSON bridge, and the returned calls are executed by your client (for example OmO).
 - **Image generation.** `POST /v1/images/generations` with `dots-image` or `muse-image` takes `prompt`, `n` (1–4), `size`, `quality` and `response_format` (`b64_json` or `url`); files are accepted as PNG, JPEG or WebP, judged by file signature and capped at 32 MiB each. `dots-image` runs on a Dot; `muse-image` generates through your own muse.ai account in an isolated Chrome profile (needs Node.js 22 or newer and Chromium) and usually returns WebP.
-- **Provider and account switches.** Every account has its own enable switch, and each provider (Dots, Muse) has a master switch that stops new jobs from routing to it without touching stored credentials. Each account also has a **keep context** switch, on by default: on, a Dots account keeps working in one thread; off, every job runs in a fresh thread that is archived afterwards, so one job's prompts and images never carry into the next.
-- **Self-healing.** A Dots account whose thread lost its agent rebinds to a fresh thread on its own; a Muse account whose session expired or whose cloud workspace VM slept renews the session and wakes the VM before running, so it recovers after a remote reset or a server reboot. When a job ends unconfirmed, the gateway re-checks that account's session before taking it out of rotation and keeps it usable if the check passes; a Muse job is retried once only after such a re-check, and the job text says so (the first attempt may still finish on Muse).
+- **Provider and account switches.** Every account has its own enable switch, and each provider (Dots, Muse) has a master switch that stops new jobs from routing to it without touching stored credentials. Muse accounts also have a **keep context** switch (see below); a Dots account always talks to its Dot in the Dot's own conversation.
+- **Self-healing.** A Dots account looks up the account's current primary Dot for every job, so it keeps working when the Dot moves to a new conversation; a Muse account whose session expired or whose cloud workspace VM slept renews the session and wakes the VM before running, so it recovers after a remote reset or a server reboot. When a job ends unconfirmed, the gateway re-checks that account's session before taking it out of rotation and keeps it usable if the check passes; a Muse job is retried once only after such a re-check, and the job text says so (the first attempt may still finish on Muse).
 - **Web console.** A React console on loopback with accounts, jobs, a job drawer with image preview, and an API guide that shows your local API key and an OmO `models.json` example.
 - **Device-code login.** You approve at `auth.openai.com/codex/device`, possibly from another computer; tokens stay on the server, encrypted with AES-256-GCM, and are refreshed 60 seconds before expiry.
-- **One job per account, in order.** A second job for the same account is accepted as `queued` and starts when the current one finishes, so concurrent requests never share a Dot thread; an account held by an interactive login or check answers `409 account_busy`, a full queue answers `429 queue_full`, and a provider with no usable account answers `503`.
+- **One job per account, in order.** A second job for the same account is accepted as `queued` and starts when the current one finishes, so concurrent requests never interleave in a Dot conversation; an account held by an interactive login or check answers `409 account_busy`, a full queue answers `429 queue_full`, and a provider with no usable account answers `503`.
 - **Loopback only.** The server binds `127.0.0.1` and the `/v1` endpoints require a Bearer API key.
 
 ## Install
@@ -76,9 +76,9 @@ ssh -N -L 3010:127.0.0.1:3010 user@server
 
 ### Connect a Dot
 
-1. In the console, open **Accounts → Add account**, enter a label and the **existing Dot** (open `https://chatgpt.com/dots`, open the Dot you want, and paste the address from the address bar, `https://chatgpt.com/dots/<ID>`; the bare ID also works), and press **Start**. This creates the account and starts the device login in one step.
+1. In the console, open **Accounts → Add account**, enter a label, and press **Start**. No Dot address is needed. This creates the account and starts the device login in one step.
 2. Open the shown ChatGPT link (`auth.openai.com/codex/device`) and approve the one-time code. The browser may be on a different computer from the server. The console polls for the approval and finishes the connection by itself; no further click is needed.
-3. dots2api never creates a thread and refuses to connect unless the thread reports `threadSource: aeon`. If you cancel before it connects, the half-created account is removed.
+3. dots2api connects to the primary Dot of that ChatGPT account and refuses to connect when the account has none. Requests, reference images and replies stay visible in the Dot conversation in ChatGPT. If you cancel before it connects, the half-created account is removed.
 
 Tokens are never returned to the browser. If a refresh is revoked or its result is unknown, log in again. **Do not share the same refresh token with Codex CLI or anything else.** An existing account can still be logged in again from its **Login** button. The full contract is in [`src/dots-auth/README.md`](src/dots-auth/README.md).
 
@@ -130,7 +130,7 @@ curl -sS http://127.0.0.1:3010/v1/images/generations \
 
 - Request: `prompt` (required), `n` (1–4, default 1), `size` (`auto`, `1024x1024`, `1536x1024`, `1024x1536`), `quality` (`auto`, `low`, `medium`, `high`), `response_format` (`b64_json` default, or `url`). Any other field returns 400.
 - Response: OpenAI-shaped `data[]` (`b64_json` or `url`, plus the `revised_prompt` the Dot actually used), `output_format: "png"` and the real `size`. A `url` points to `GET /api/jobs/:id/images/0` and **needs the API key**.
-- One image takes about a minute, and `n` images are made one after another in the same Dot thread. If the last ones fail, the finished images are returned and the `X-Dots2api-Images-Requested` and `X-Dots2api-Images-Returned` headers say how many.
+- One image takes about a minute, and `n` images are made one after another in the same Dot conversation. If the last ones fail, the finished images are returned and the `X-Dots2api-Images-Requested` and `X-Dots2api-Images-Returned` headers say how many.
 - Reference-image edits use `POST /v1/images/edits` with `dots-image` or `muse-image` and multipart uploads:
 
 ```bash
@@ -152,7 +152,7 @@ Send long work asynchronously with `POST /api/jobs {"provider":"dots","prompt":"
 
 1. A client calls `/v1/...` with the Bearer key, or the console calls `/api/...` from the same origin.
 2. The gateway picks an enabled account that is not already running a job, and queues work for a busy account behind the job in flight.
-3. The Dots provider opens `wss://codex-cloud-backend.chatgpt.com` and speaks the app-server JSON-RPC that the Codex client uses, on your existing Aeon thread.
+3. The Dots provider posts to the same Dot conversation the ChatGPT web app uses (`/backend-api/messaging`, reference images uploaded as conversation files), waits until the Dot has finished (its thread on `wss://codex-cloud-backend.chatgpt.com` reports `idle`), then collects the replies and attached images.
 4. The job and its state are persisted in SQLite.
 5. Chat output is returned as OpenAI JSON or SSE; images are checked by file signature and saved under `images/<job id>/`.
 6. A timeout or restart with an unknown remote outcome marks the job `unknown` and is never resent automatically.

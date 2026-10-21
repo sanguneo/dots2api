@@ -23,8 +23,7 @@ Restarting login replaces and aborts the old session.
 
 Hold the gateway's account operation lease through each start/finish HTTP call.
 Release it while waiting for the person to authenticate. On successful finish,
-persist the returned credential set together with the explicitly selected
-existing Dot `threadId` and approved endpoint, then check that thread. Do not
+persist the returned credential set, then check the account's primary Dot. Do not
 return credentials from the HTTP API. Login alone does not verify Dot access.
 Call `clear(id)` on cancellation/deletion, and `close()` at server shutdown.
 
@@ -52,7 +51,7 @@ expiry is known and elapsed, the service reports a reconnect-required 401.
 
 Stored fields are strings: `accessToken`, `accountId`, `refreshToken`, optional
 `idToken`, `expiresAt` (epoch milliseconds), and `refreshState`. Other fields such
-as `threadId` and `endpoint` survive rotation.
+as `endpoint` survive rotation.
 
 The save callback runs twice during refresh:
 

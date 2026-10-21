@@ -105,10 +105,6 @@ export function AccountDrawer({ account, onClose }: { readonly account: Account;
   const gone = accounts.data !== null && current === null;
   const busy = current?.busy ?? false;
   const blocked = saving !== null || provider === null || gone || busy;
-  const keepContextNote =
-    account.provider === "muse"
-      ? "Muse는 작업마다 새 대화를 엽니다. 켜 두면 그 대화가 Muse 앱의 사이드 챗으로 남고, 끄면 작업이 성공한 뒤 그 사이드 챗을 삭제합니다. 삭제는 되돌릴 수 없습니다."
-      : "켜 두면 계정의 대화 하나를 계속 쓰고, 이미지가 많이 쌓이면 새 대화로 교체합니다. 끄면 작업마다 새 대화를 열고 끝나면 보관합니다. 앞사람의 프롬프트와 이미지가 다음 작업에 남지 않고, 계정에 저장된 대화는 그대로라 다시 켜면 이어서 씁니다.";
 
   async function save(mode: SaveMode): Promise<void> {
     if (blocked || provider === null) return;
@@ -216,21 +212,23 @@ export function AccountDrawer({ account, onClose }: { readonly account: Account;
           </Field>
         </div>
 
-        <div className="form__section">
-          <div className="form__section-head">
-            <p className="form__section-title">대화 유지</p>
+        {account.provider === "muse" ? (
+          <div className="form__section">
+            <div className="form__section-head">
+              <p className="form__section-title">대화 유지</p>
+            </div>
+            <div className="account__switch">
+              <Switch
+                checked={keepContext}
+                label={`${account.label} 대화 유지`}
+                disabled={busy}
+                onChange={setKeepContext}
+              />
+              <span aria-hidden="true">{keepContext ? "대화 유지" : "사이드 챗 삭제"}</span>
+            </div>
+            <p className="quiet">Muse는 작업마다 새 대화를 엽니다. 켜 두면 그 대화가 Muse 앱의 사이드 챗으로 남고, 끄면 작업이 성공한 뒤 그 사이드 챗을 삭제합니다. 삭제는 되돌릴 수 없습니다.</p>
           </div>
-          <div className="account__switch">
-            <Switch
-              checked={keepContext}
-              label={`${account.label} 대화 유지`}
-              disabled={busy}
-              onChange={setKeepContext}
-            />
-            <span aria-hidden="true">{keepContext ? "대화 유지" : account.provider === "muse" ? "사이드 챗 삭제" : "작업마다 새 대화"}</span>
-          </div>
-          <p className="quiet">{keepContextNote}</p>
-        </div>
+        ) : null}
 
         <Notice title="다시 로그인하려면">
           <p>인증이 만료되면 계정 목록의 ‘로그인’ 버튼으로 다시 로그인하세요. 아래 값을 직접 넣을 필요는 없습니다.</p>

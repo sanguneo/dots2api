@@ -134,14 +134,3 @@ export function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-export function parseThreadId(input: string): string {
-  const value = input.trim();
-  if (!/^https?:\/\//i.test(value)) return value;
-  try {
-    const url = new URL(value);
-    const [section, id] = url.pathname.split("/").filter(Boolean);
-    return url.hostname === "chatgpt.com" && section === "dots" ? (id ?? "") : value;
-  } catch {
-    return value;
-  }
-}

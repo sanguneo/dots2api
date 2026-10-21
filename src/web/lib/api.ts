@@ -294,12 +294,12 @@ export type DotsDevice = z.infer<typeof dotsDeviceSchema>;
 export async function startDotsLogin(id: AccountId): Promise<DotsDevice> {
   return read(dotsDeviceSchema, () => http.post(`${accountPath(id)}/dots-login/start`, { retry: 0 }).json(), "Dots login start");
 }
-export async function completeDotsLogin(id: AccountId, threadId: string) {
+export async function completeDotsLogin(id: AccountId) {
   return read(z.discriminatedUnion("status", [
     z.object({ status: z.literal("pending"), retryAfterMs: z.number() }),
     z.object({ status: z.literal("connected"), account: accountSchema }),
   ]), () => http.post(`${accountPath(id)}/dots-login/complete`, {
-    json: { threadId }, retry: 0, timeout: false,
+    retry: 0, timeout: false,
   }).json(), "Dots login complete");
 }
 export async function cancelDotsLogin(id: AccountId): Promise<void> {

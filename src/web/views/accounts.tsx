@@ -32,8 +32,6 @@ function AccountRow({ account, provider, contextWindow, contextBasis, checkStart
   const titleId = useId();
   const checking = checkStartedAt !== undefined;
   const lockedByServer = account.busy && !checking;
-  // The full explanation lives in the edit drawer; the row only names what "off" does for this provider.
-  const freshLabel = account.provider === "muse" ? "사이드 챗 삭제" : "작업마다 새 대화";
 
   async function toggle(enabled: boolean): Promise<void> {
     setToggling(true);
@@ -121,17 +119,19 @@ function AccountRow({ account, provider, contextWindow, contextBasis, checkStart
           />
           <span aria-hidden="true">{account.enabled ? "활성" : "비활성"}</span>
         </div>
-        <div className="account__switch">
-          <Switch
-            checked={account.keepContext}
-            label={`${account.label} 대화 유지`}
-            loading={togglingKeep}
-            disabled={account.busy}
-            title={account.busy ? BUSY_TITLE : undefined}
-            onChange={(keepContext) => void toggleKeep(keepContext)}
-          />
-          <span aria-hidden="true">{account.keepContext ? "대화 유지" : freshLabel}</span>
-        </div>
+        {account.provider === "muse" ? (
+          <div className="account__switch">
+            <Switch
+              checked={account.keepContext}
+              label={`${account.label} 대화 유지`}
+              loading={togglingKeep}
+              disabled={account.busy}
+              title={account.busy ? BUSY_TITLE : undefined}
+              onChange={(keepContext) => void toggleKeep(keepContext)}
+            />
+            <span aria-hidden="true">{account.keepContext ? "대화 유지" : "사이드 챗 삭제"}</span>
+          </div>
+        ) : null}
         <div className="account__actions">
           <Button size="sm" icon={<LogIn aria-hidden="true" />} disabled={account.busy} onClick={() => setLoginOpen(true)}>
             로그인

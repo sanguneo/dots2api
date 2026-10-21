@@ -1,5 +1,4 @@
 import type { Hono } from "hono";
-import { z } from "zod";
 import { accountIdSchema, GatewayError } from "./contracts";
 import type { AccountId } from "./contracts";
 import type { Gateway } from "./gateway";
@@ -21,7 +20,6 @@ export function attachDotsLogin(app: Hono, gateway: Gateway, device: DotsAuth): 
   });
   app.post("/api/accounts/:id/dots-login/complete", async (c) => {
     const id = account(c.req.param("id"));
-    const { threadId } = z.object({ threadId: z.string().trim().min(1).max(200) }).parse(await c.req.json());
     const release = gateway.reserve(id);
     try {
       const result = await device.finish(id);
@@ -29,8 +27,8 @@ export function attachDotsLogin(app: Hono, gateway: Gateway, device: DotsAuth): 
       // Replace rather than merge: a new identity must not inherit old refresh state/endpoints.
       gateway.store.saveAccount({
         ...gateway.account(id), status: "unconnected", checkedAt: null,
-        detail: "Device authorized. Checking the selected existing Dot.",
-      }, { ...result.credentials, threadId });
+        detail: "Device authorized. Checking the account's Dot.",
+      }, result.credentials);
       return c.json({ status: "connected", account: await gateway.checkReserved(id) });
     } finally { release(); }
   });

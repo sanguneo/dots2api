@@ -10,17 +10,6 @@ import type { Tone } from "./ui";
 const accountTone = { unconnected: "neutral", ready: "ok", error: "danger" } as const satisfies Record<AccountStatus, Tone>;
 const jobTone = { queued: "neutral", running: "accent", completed: "ok", failed: "danger", unknown: "warn" } as const satisfies Record<JobStatus, Tone>;
 
-export function DotAddressHint() {
-  return (
-    <>
-      <a className="link" href="https://chatgpt.com/dots" target="_blank" rel="noreferrer noopener">
-        https://chatgpt.com/dots
-      </a>
-      에 접속해 사용할 Dot을 연 다음, 주소창의 주소를 복사해 붙여넣어 주세요. 주소는 <span className="mono">https://chatgpt.com/dots/…</span> 모양입니다.
-    </>
-  );
-}
-
 export function AccountStatusBadge({ account, checkStartedAt }: { readonly account: Account; readonly checkStartedAt?: number | undefined }) {
   if (checkStartedAt !== undefined) {
     return (
