@@ -1691,6 +1691,18 @@ svg.lucide {
   gap: var(--space-2);
 }
 
+.muse-stage__typing {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.muse-stage__typing .input {
+  flex: 1 1 12rem;
+  min-width: 0;
+}
+
 .muse-stage__hint {
   margin-right: auto;
   color: var(--ink-3);
@@ -1708,7 +1720,7 @@ svg.lucide {
 
 /* Largest 8:5 box that fits under the toolbar; the canvas keeps its aspect-ratio, so pointer mapping stays exact. */
 .muse-stage--expanded .muse-viewer {
-  width: min(100%, calc((100dvh - 5.5rem) * 8 / 5));
+  width: min(100%, calc((100dvh - 9rem) * 8 / 5));
   margin: 0 auto;
 }
 

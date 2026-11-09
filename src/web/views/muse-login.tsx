@@ -36,6 +36,8 @@ export function MuseLoginPanel({ account, autostart = false, onConnected, onClos
   const [loading, setLoading] = useState(!autostart);
   const [error, setError] = useState<string | null>(null);
   const [expanded, setExpanded] = useState(false);
+  const [typed, setTyped] = useState("");
+  const [hidden, setHidden] = useState(false);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const socketRef = useRef<WebSocket | null>(null);
   const sizeRef = useRef(DEFAULT_SIZE);
@@ -234,6 +236,33 @@ export function MuseLoginPanel({ account, autostart = false, onConnected, onClos
             onWheel={(event) => { const p = point(event); send({ t: "wheel", ...p, dx: event.deltaX, dy: event.deltaY }); }}
             onKeyDown={key}
           />
+          {/* A canvas never raises a phone's keyboard, so text reaches the remote page through a real input instead. */}
+          <form
+            className="muse-stage__typing"
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (typed) send({ t: "text", text: typed });
+              setTyped("");
+            }}
+          >
+            <input
+              className="input"
+              type={hidden ? "password" : "text"}
+              value={typed}
+              onChange={(event) => setTyped(event.target.value)}
+              placeholder="원격 화면의 칸을 누른 뒤 여기 입력하고 보내기"
+              autoComplete="off"
+              autoCapitalize="off"
+              autoCorrect="off"
+              spellCheck={false}
+              aria-label="원격 브라우저로 보낼 글자"
+            />
+            <Button size="sm" type="submit">보내기</Button>
+            <Button size="sm" variant="ghost" onClick={() => setHidden((value) => !value)}>{hidden ? "보이기" : "가리기"}</Button>
+            <Button size="sm" variant="ghost" onClick={() => send({ t: "key", key: "Backspace", code: "Backspace" })}>⌫</Button>
+            <Button size="sm" variant="ghost" onClick={() => send({ t: "key", key: "Tab", code: "Tab" })}>Tab</Button>
+            <Button size="sm" variant="ghost" onClick={() => send({ t: "key", key: "Enter", code: "Enter", text: "\r" })}>Enter</Button>
+          </form>
         </div>
       ) : (
         <p className="section-note">화면을 클릭하면 키보드 입력이 원격 브라우저로 전달됩니다. 뷰어는 이 콘솔과 같은 포트를 쓰므로 추가 SSH 터널이 필요 없습니다.</p>
