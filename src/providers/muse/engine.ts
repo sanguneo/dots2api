@@ -430,7 +430,9 @@ export function createMuseAdapter(site = "https://muse.ai", chatTimeout = CHAT_T
           return document.documentElement.dataset["museComplete"] === "true";
         }, null, { timeout: chatTimeout });
         const images = await generatedImages(page, baseline);
-        const text = await page.locator('div[class*="hatch-agent-bubble-bg"]').last().innerText();
+        // An image-only answer has no agent text bubble, and waiting for one timed out after the image had arrived.
+        const bubbles = page.locator('div[class*="hatch-agent-bubble-bg"]');
+        const text = await bubbles.count() ? await bubbles.last().innerText({ timeout: 5_000 }) : "";
         if (!text.trim() && images.length === 0) throw new GatewayError("muse_result", "Muse finished without text or an image.", 502, true);
         const match = /^\/thread\/([^/]+)\/?$/.exec(new URL(page.url()).pathname);
         if (pruneThreads) await pruneCurrentThread(page);
