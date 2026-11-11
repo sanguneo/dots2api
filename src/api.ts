@@ -3,6 +3,7 @@ import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
 import { z } from "zod";
 import { accountIdSchema, GatewayError, jobIdSchema, providerIdSchema } from "./contracts";
+import type { ProviderId } from "./contracts";
 import type { Gateway } from "./gateway";
 import { chatBridgeInputSchema, prepareChatBridge, parseRemoteAssistant } from "./chat-bridge";
 import { attachDotsLogin } from "./dots-login-routes";
@@ -15,8 +16,10 @@ const createAccount = z.object({ provider: providerIdSchema, label: z.string().t
 const patchAccount = z.object({ label: z.string().trim().min(1).max(80).optional(), enabled: z.boolean().optional(), keepContext: z.boolean().optional(), credentials: credentials.optional() });
 const jobInput = z.object({ accountId: accountIdSchema.optional(), provider: providerIdSchema.optional(), prompt: z.string().trim().min(1).max(4_000_000) })
   .refine((value) => value.accountId || value.provider, "Choose an account or provider.");
+/** Chat models this gateway serves and the provider account each one runs on. */
+const CHAT_MODELS = { "dots-agent": "dots", "muse-agent": "muse" } as const satisfies Readonly<Record<string, ProviderId>>;
 const chatInput = chatBridgeInputSchema.extend({
-  model: z.literal("dots-agent"),
+  model: z.enum(["dots-agent", "muse-agent"]),
   stream: z.boolean().default(false),
   response_format: z.unknown().optional(),
 });
@@ -155,14 +158,25 @@ export function createApi(gateway: Gateway, dotsAuth?: DotsAuth, museLogin?: Mus
   app.post("/v1/chat/completions", async (c) => {
     const body = chatInput.parse(await c.req.json());
     if (body.response_format !== undefined) throw new GatewayError("unsupported_parameter", "response_format is not supported.", 422);
+    const provider = CHAT_MODELS[body.model];
+    // Muse is a browser agent chat: it has no prompted-tool bridge, so tools fail before any remote work is submitted.
+    if (provider === "muse" && (body.tools.length > 0 || (body.tool_choice !== undefined && body.tool_choice !== "none"))) {
+      throw new GatewayError("unsupported_parameter", "muse-agent does not support tools or tool_choice.", 400);
+    }
     const bridge = prepareChatBridge(body);
     for (const [name, value] of Object.entries(bridge.headers)) c.header(name, value);
-    const job = gateway.submit({ provider: "dots", prompt: bridge.prompt });
+    const job = gateway.submit({ provider, prompt: bridge.prompt });
     c.header("X-Dots2api-Job-Id", job.id);
     c.header("X-Dots2api-Usage", "unknown");
     const result = await gateway.wait(job.id);
     if (result.status !== "completed") throw new GatewayError("upstream_unconfirmed", result.error ?? "Remote result is not confirmed.", 502, result.status === "unknown");
-    const completion = parseRemoteAssistant(result.output, bridge);
+    // An image answer is reachable as a stored job image; an image-only answer still has a non-empty reply.
+    const origin = new URL(c.req.url).origin;
+    const imageLinks = provider === "muse"
+      ? result.images.map((_, index) => `![image ${index + 1}](${origin}/api/jobs/${job.id}/images/${index})`)
+      : [];
+    const text = [result.output, ...imageLinks].filter((part) => part.trim().length > 0).join("\n\n");
+    const completion = parseRemoteAssistant(text, bridge);
     const id = `chatcmpl-${job.id}`;
     const created = Math.floor(Date.now() / 1000);
     if (!body.stream) return c.json({

@@ -18,13 +18,13 @@
 
 <!-- README-I18N:END -->
 
-**[dots2api](https://github.com/yelixir-dev/dots2api)**("Dot to API")는 내 OpenAI **Dot**을 채팅(`chat/completions`, 도구 호출 포함)과 이미지 생성으로 열어 주는 개인용 게이트웨이이며, 계정·작업 기록·생성한 이미지를 관리하는 웹 콘솔이 함께 있습니다. 모델 ID는 **`dots-agent`**(채팅)와 이미지 모델 **`dots-image`**(내 Dot), **`muse-image`**(내 muse.ai 계정)입니다.
+**[dots2api](https://github.com/yelixir-dev/dots2api)**("Dot to API")는 내 OpenAI **Dot**을 채팅(`chat/completions`, 도구 호출 포함)과 이미지 생성으로 열어 주는 개인용 게이트웨이이며, 계정·작업 기록·생성한 이미지를 관리하는 웹 콘솔이 함께 있습니다. 모델 ID는 채팅 모델 **`dots-agent`**(내 Dot)와 **`muse-agent`**(내 muse.ai 계정), 이미지 모델 **`dots-image`**(내 Dot), **`muse-image`**(내 muse.ai 계정)입니다.
 
 [기능](#기능) · [설치](#설치) · [사용법](#사용법) · [동작 방식](#동작-방식) · [저장소 구조](#저장소-구조) · [현재 한계](#현재-한계) · [라이선스](#라이선스)
 
 ## 기능
 
-- **OpenAI 방식 채팅.** `dots-agent`로 `POST /v1/chat/completions`를 호출하며, `tools`와 `tool_choice`는 프롬프트 기반 JSON 브리지로 동작하고 반환된 호출은 클라이언트(예: OmO)가 실행합니다.
+- **OpenAI 방식 채팅.** `muse-agent`는 대화를 내 muse.ai 계정의 Muse 컴포저로 보내고 에이전트의 답변 텍스트를 돌려줍니다(`stream: true`도 버퍼링해 전달). 도구 브리지가 없어 `tools`는 400(`unsupported_parameter`)으로 거절하며, Muse가 이미지로 답하면 저장된 작업 이미지의 마크다운 링크가 답변에 들어가고 이미지만 있는 답도 타임아웃이 아닙니다. 계정의 대화 유지 스위치는 `muse-image`와 같게 동작합니다. `dots-agent`로 `POST /v1/chat/completions`를 호출하며, `tools`와 `tool_choice`는 프롬프트 기반 JSON 브리지로 동작하고 반환된 호출은 클라이언트(예: OmO)가 실행합니다.
 - **이미지 생성.** `dots-image` 또는 `muse-image`로 `POST /v1/images/generations`를 호출하며 `prompt`, `n`(1~4), `size`, `quality`, `response_format`(`b64_json` 또는 `url`)을 받고, 파일은 서명으로 판별해 PNG/JPEG/WebP만 장당 32 MiB 이하로 받습니다. `dots-image`는 Dot이, `muse-image`는 격리된 Chrome 프로파일에서 내 muse.ai 계정이 생성하며(Node.js 22 이상과 Chromium 필요) 보통 WebP를 돌려줍니다.
 - **공급자·계정 스위치.** 계정마다 자체 활성 스위치가 있고, 공급자(Dots, Muse)마다 저장된 자격 증명은 그대로 둔 채 새 작업이 그 공급자로 가지 않게 하는 상위 스위치가 있습니다. Muse 계정에는 **대화 유지** 스위치도 있습니다(아래 참고). Dots 계정은 항상 Dot 자신의 대화에서 Dot과 대화합니다.
 - **자가 복구.** Dots 계정은 작업마다 계정의 현재 기본 Dot을 다시 찾아 쓰므로 Dot이 새 대화로 옮겨가도 다시 연결할 필요가 없고, muse.ai 세션이 만료됐거나 클라우드 작업 VM이 잠든 계정은 실행 전에 세션을 갱신하고 VM을 깨워 원격 리셋·서버 재부팅 뒤에도 다시 정상화됩니다. 작업이 확인되지 않은 채 끝나면 게이트웨이는 그 계정을 작업에서 빼기 전에 세션을 다시 확인하고, 확인되면 계속 쓸 수 있게 둡니다. Muse 작업은 이렇게 재확인한 뒤에만 한 번 재시도하며, 재시도 사실을 작업 결과 텍스트에 남깁니다(첫 시도가 Muse에서 나중에 끝날 수 있습니다).

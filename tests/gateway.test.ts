@@ -19,7 +19,7 @@ function fixture(run: ProviderAdapter["run"] = async () => ({ text: "fixture res
     return {
       info: { id, name: id, description: "Test transport", setupUrl: "https://example.org", fields: [],
         contextWindow: 123456, contextBasis: "configured",
-        capabilities: { nativeTools: false, usage: "unknown", execution: "remote-agent", chat: id === "dots" } },
+        capabilities: { nativeTools: false, usage: "unknown", execution: "remote-agent", chat: true } },
       validate: (credentials) => credentials,
       check: async () => ({ detail: "Connected to fixture." }),
       run,
@@ -492,6 +492,63 @@ describe("account isolation and job state", () => {
     expect(text).toContain("fixture result");
     expect(text).not.toContain('"usage"');
     expect(result.headers.get("x-dots2api-usage")).toBe("unknown");
+  });
+  test("lists muse-agent beside dots-agent as chat models", async () => {
+    // Given both providers declare chat support.
+    const { app, store } = fixture();
+    // When clients discover models.
+    const models = await app.request("http://localhost/v1/models", { headers: { authorization: `Bearer ${store.apiKey}` } });
+    // Then both agents are listed with chat enabled, next to the image models.
+    const data: { id: string; capabilities: { chat?: boolean } }[] = (await models.json()).data;
+    expect(data.filter((model) => model.capabilities.chat).map((model) => model.id)).toEqual(["dots-agent", "muse-agent"]);
+    expect(data.map((model) => model.id)).toContain("muse-image");
+  });
+  test("routes muse-agent to a Muse account and returns its reply", async () => {
+    // Given ready Dots and Muse accounts and a transport that records who ran.
+    const { app, store, gateway } = fixture(async () => ({ text: "muse says hi", remoteId: "thread-1" }));
+    await gateway.check(gateway.create("dots", "Dots", {}).id);
+    await gateway.check(gateway.create("muse", "Muse", {}).id);
+    // When chatting with the muse-agent model.
+    const response = await app.request("http://localhost/v1/chat/completions", {
+      method: "POST", headers: { authorization: `Bearer ${store.apiKey}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "muse-agent", messages: [{ role: "user", content: "hello" }] }),
+    });
+    // Then the Muse account ran the job and its text is the assistant message.
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.model).toBe("muse-agent");
+    expect(body.choices[0].message).toEqual({ role: "assistant", content: "muse says hi" });
+    expect(String(gateway.store.job(jobIdSchema.parse(response.headers.get("x-dots2api-job-id")))?.provider)).toBe("muse");
+  });
+  test("links a stored image when muse-agent answers with an image only", async () => {
+    // Given a Muse turn that produced an image and no text.
+    const png = Uint8Array.from(Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==", "base64"));
+    const { app, store, gateway } = fixture(async () => ({ text: "", remoteId: "thread-2", images: [{ mime: "image/png", data: png }] }));
+    await gateway.check(gateway.create("muse", "Muse", {}).id);
+    // When chatting.
+    const response = await app.request("http://localhost/v1/chat/completions", {
+      method: "POST", headers: { authorization: `Bearer ${store.apiKey}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "muse-agent", messages: [{ role: "user", content: "draw" }] }),
+    });
+    // Then the reply is a markdown link to the stored job image rather than an empty message.
+    expect(response.status).toBe(200);
+    const jobId = response.headers.get("x-dots2api-job-id");
+    expect((await response.json()).choices[0].message.content).toBe(`![image 1](http://localhost/api/jobs/${jobId}/images/0)`);
+  });
+  test("rejects tools for muse-agent before submitting any work", async () => {
+    // Given a Muse account and a transport that must not run.
+    let calls = 0;
+    const { app, store, gateway } = fixture(async () => { calls++; return { text: "no", remoteId: null }; });
+    await gateway.check(gateway.create("muse", "Muse", {}).id);
+    // When tools are supplied.
+    const response = await app.request("http://localhost/v1/chat/completions", {
+      method: "POST", headers: { authorization: `Bearer ${store.apiKey}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "muse-agent", messages: [{ role: "user", content: "x" }], tools: [{ type: "function", function: { name: "f" } }] }),
+    });
+    // Then it is a clear 400 and nothing was sent.
+    expect(response.status).toBe(400);
+    expect((await response.json()).error.code).toBe("unsupported_parameter");
+    expect(calls).toBe(0);
   });
   test("preserves developer instructions and ordered text parts in chat history", async () => {
     // Given a ready agent and a multipart OmO conversation.

@@ -331,7 +331,7 @@ export function createMuseAdapter(site = "https://muse.ai", chatTimeout = CHAT_T
       name: "Muse",
       contextWindow: 180_000,
       contextBasis: "measured-heuristic",
-      description: "Generates images with your own muse.ai account in an isolated Chrome profile per account. Each job starts a new thread.",
+      description: "Chats (muse-agent) and generates images (muse-image) with your own muse.ai account in an isolated Chrome profile per account. Each job starts a new thread.",
       setupUrl: "https://muse.ai/",
       fields: [
         {
@@ -347,7 +347,7 @@ export function createMuseAdapter(site = "https://muse.ai", chatTimeout = CHAT_T
           help: "Set to true, then press Check on the same desktop. A headed isolated browser opens for up to 2 minutes; sign in with Google there. The account's browser profile is saved under the data directory and reused without imported cookies. Set back to false after signing in.",
         },
       ],
-      capabilities: { nativeTools: false, usage: "unknown", execution: "remote-agent", chat: false },
+      capabilities: { nativeTools: false, usage: "unknown", execution: "remote-agent", chat: true },
     },
     validate(credentials) {
       const result = configuration.safeParse(credentials);

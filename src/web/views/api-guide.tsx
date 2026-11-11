@@ -202,6 +202,9 @@ function Guide({ settings, models, onReloadModels }: GuideProps) {
             <strong>공급자 스위치</strong> 개요 화면의 공급자 스위치로 Dots나 Muse 전체를 끌 수 있습니다. 꺼진 공급자로는 새 작업이 가지 않고, 그 모델을 호출하면 503(provider_disabled)을 돌려줍니다. 이미 실행 중인 작업은 끝까지 진행됩니다.
           </li>
           <li>
+            <strong>muse-agent 채팅</strong> model에 muse-agent를 쓰면 내 muse.ai 계정의 Muse 에이전트가 답합니다. 도구 호출은 지원하지 않아 tools를 보내면 400(unsupported_parameter)이며, Muse가 이미지로 답하면 저장된 이미지 링크가 답변에 들어갑니다.
+          </li>
+          <li>
             <strong>이미지 생성</strong> POST /v1/images/generations는 공급자에게 이미지를 만들어 달라고 요청한 뒤 받은 파일을 b64_json 또는 url로 돌려줍니다. model은 dots-image(내 Dot) 또는
             muse-image(내 muse.ai 계정)이며, 생략하면 dots-image입니다. n은 1~4이고 한 장씩 차례로 만들어 장당 약 1분 걸립니다. size와 quality는 공급자가 지키도록 말로 요청하는 참고값이라 결과 크기가
             다를 수 있습니다(응답의 size에 실제 크기, output_format에 실제 형식). 이미지 파일은 data/images에 남고 작업 상세에서 볼 수 있습니다.

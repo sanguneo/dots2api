@@ -77,6 +77,8 @@ const html = `<!doctype html><html><body>
       const agent = document.querySelector(".hatch-agent-bubble-bg");
       if (input.value.startsWith("draw")) {
         agent.innerHTML = '<div data-testid="hatch-chat-attachment-presentation-1"><img src="/media/result.png"></div>';
+      } else if (input.value.startsWith("say")) {
+        agent.innerHTML = "<p>First line.</p><p>Second line.</p>";
       } else {
         agent.textContent = "A complete answer";
       }
@@ -156,6 +158,18 @@ describe("Muse browser adapter", () => {
     const result = await adapter.run({}, "hello", context);
     // Then only the completed assistant message and thread ID are returned, with no image.
     expect(result).toEqual({ text: "A complete answer", remoteId: "synthetic-123" });
+  }, 60_000);
+
+  it("declares chat support and returns the agent's text bubble as the reply", async () => {
+    // Given a signed-in account and an adapter that serves muse-agent.
+    const context = { accountId: accountA, dataDir, signal: new AbortController().signal };
+    await adapter.check({ cookieHeader: "hatch_sess=valid" }, context);
+    expect(adapter.info.capabilities.chat).toBe(true);
+    // When the agent answers with a two-paragraph text bubble.
+    const result = await adapter.run({}, "say two lines", context);
+    // Then the whole bubble text is the reply and no image is attached.
+    expect(result.text).toBe("First line.\n\nSecond line.");
+    expect(result.images).toBeUndefined();
   }, 60_000);
 
   it("returns a generated image's bytes and size, not an uploaded or historical one", async () => {
