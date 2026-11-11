@@ -15,7 +15,10 @@ import { MAX_IMAGE_BYTES } from "./images";
 const store = new Store(resolve(process.env["DOTS2API_DATA_DIR"] ?? "data"));
 store.recoverInterruptedJobs();
 const dotsAuth = new DotsAuth();
-const gateway = new Gateway(store, { dots: dotsAdapter, muse: museAdapter }, dotsAuth);
+const imageIdleSeconds = Number(process.env["DOTS2API_MUSE_IMAGE_IDLE_SECONDS"] ?? 600);
+const gateway = new Gateway(store, { dots: dotsAdapter, muse: museAdapter }, dotsAuth, {
+  ...(Number.isFinite(imageIdleSeconds) && imageIdleSeconds > 0 ? { imageIdleMs: imageIdleSeconds * 1000 } : {}),
+});
 const museLogin = createMuseLoginService({ dataDir: store.dataDir, onEnded: (session) => museRoutes.handleEnded(session) });
 const museRoutes = new MuseLoginRoutes(gateway, museLogin);
 const api = createApi(gateway, dotsAuth, museRoutes);
@@ -74,6 +77,9 @@ const server = Bun.serve<ViewerData>({
 });
 console.log(`dots2api ready at ${server.url}`);
 console.log("Open the local console to connect accounts. Credentials are stored encrypted in data/.");
+gateway.startSweeper();
+// A restart can leave an account in error; re-verify those the way the Check button does.
+void gateway.recheckErroredAccounts().then((recovered) => { if (recovered > 0) console.log(`Re-checked accounts at startup: ${recovered} back in rotation.`); });
 
 async function shutdown(): Promise<void> {
   if (stopping) return;

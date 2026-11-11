@@ -5,6 +5,7 @@ import { GatewayError } from "./contracts";
 import type { Job, ProviderId, ReferenceImage } from "./contracts";
 import type { Gateway } from "./gateway";
 import { buildImagePrompt } from "./image-prompt";
+import { parseThreadKey, THREAD_HEADER } from "./thread-key";
 import { MAX_IMAGE_BYTES, MAX_IMAGES, sniffImage, validateReferenceImages } from "./images";
 
 const MAX_N = 4;
@@ -24,6 +25,7 @@ const request = z.strictObject({
   background: z.enum(["auto", "opaque"]).optional(),
   moderation: z.literal("auto").optional(),
   user: z.string().optional(),
+  thread: z.string().optional(),
 });
 
 /** Resolve the requested model to a provider; an omitted model uses the default image model. */
@@ -82,6 +84,7 @@ export function attachImageGeneration(app: Hono, gateway: Gateway): void {
     } else input = await c.req.json();
     const body = request.parse(input);
     const provider = imageProvider(body.model);
+    const thread = parseThreadKey(body.thread, c.req.header(THREAD_HEADER));
     const origin = new URL(c.req.url).origin;
     const prompt = buildImagePrompt({ prompt: body.prompt, size: body.size, quality: body.quality });
     const data: Array<Record<string, string>> = [];
@@ -89,7 +92,7 @@ export function attachImageGeneration(app: Hono, gateway: Gateway): void {
     let first: { width?: number | undefined; height?: number | undefined; format?: "png" | "jpeg" | "webp" } = {};
     let failure: GatewayError | undefined;
     for (let index = 0; index < body.n; index++) {
-      const job: Job = gateway.submit({ provider, prompt, ...(referenceImages ? { referenceImages } : {}) });
+      const job: Job = gateway.submit({ provider, prompt, kind: "image", ...(thread ? { thread } : {}), ...(referenceImages ? { referenceImages } : {}) });
       jobIds.push(job.id);
       const result = await gateway.wait(job.id);
       if (result.status !== "completed") {

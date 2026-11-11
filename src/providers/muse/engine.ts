@@ -4,7 +4,7 @@ import { chromium } from "playwright";
 import type { BrowserContext, Page } from "playwright";
 import { z } from "zod";
 import { GatewayError } from "../../contracts";
-import type { AdapterContext, Credentials, ProviderAdapter, ReferenceImage, RunImage, RunResult } from "../../contracts";
+import type { AdapterContext, Credentials, ProviderAdapter, ReferenceImage, RunImage, RunResult, ThreadDeletion } from "../../contracts";
 import { IMAGE_EXTENSIONS, MAX_IMAGES } from "../../images";
 
 const configuration = z.object({
@@ -17,6 +17,8 @@ const importedCookies = z.union([
   z.array(z.object({ name: z.string(), value: z.string(), domain: z.string().optional() })),
 ]);
 const CHAT_TIMEOUT = 300_000;
+/** A thread id goes into a URL path, so only the characters Muse itself uses are allowed. */
+const THREAD_ID = /^[A-Za-z0-9_-]{1,128}$/;
 const ATTACHMENT_TIMEOUT = 10_000;
 /** References can total 32 MiB, so their upload gets its own, much longer, budget than a thumbnail read. */
 const REFERENCE_UPLOAD_TIMEOUT = 120_000;
@@ -372,6 +374,30 @@ export function createMuseAdapter(site = "https://muse.ai", chatTimeout = CHAT_T
         await browser.close();
       }
     },
+    /**
+     * Deletes one side chat by id through the same single-row path a finished job uses. "gone" only when Muse itself sends
+     * the page home; a page that is not the thread for any other reason is a failure to retry, never a deletion.
+     */
+    async deleteThread(credentials, threadId, context): Promise<ThreadDeletion> {
+      const config = this.validate(credentials);
+      if (!THREAD_ID.test(threadId)) return "failed";
+      const browser = await openBrowser({ ...config, login: "false" }, context, origin);
+      try {
+        const page = browser.pages()[0] ?? await browser.newPage();
+        const path = `/thread/${threadId}`;
+        await page.goto(new URL(path, origin).href, { waitUntil: "domcontentloaded", timeout: 30_000 });
+        await page.locator("textarea").first().waitFor({ state: "visible", timeout: 20_000 });
+        const where = new URL(page.url()).pathname.replace(/\/$/, "");
+        if (where === "/thread/new" || where === "") return "gone";
+        if (where !== path) return "failed";
+        await page.locator('[data-testid="hatch-thread-row"][aria-current="page"]').first().waitFor({ state: "visible", timeout: 10_000 });
+        return await pruneCurrentThread(page) ? "deleted" : "failed";
+      } catch {
+        return "failed";
+      } finally {
+        await browser.close();
+      }
+    },
     async run(credentials, prompt, context): Promise<RunResult> {
       const config = this.validate(credentials);
       if (!prompt.trim()) throw new GatewayError("muse_prompt", "Prompt must not be empty.");
@@ -382,13 +408,25 @@ export function createMuseAdapter(site = "https://muse.ai", chatTimeout = CHAT_T
       let page: Page | undefined;
       try {
         page = browser.pages()[0] ?? await browser.newPage();
-        await page.goto(new URL("/thread/new", origin).href, { waitUntil: "domcontentloaded", timeout: 30_000 });
+        // A topic key reopens its side chat. If that chat is gone (deleted by hand, or Muse redirects away), start a new one.
+        let reused = false;
+        if (context.threadId && THREAD_ID.test(context.threadId)) {
+          const path = `/thread/${context.threadId}`;
+          try {
+            await page.goto(new URL(path, origin).href, { waitUntil: "domcontentloaded", timeout: 30_000 });
+            await page.locator("textarea").first().waitFor({ state: "visible", timeout: 20_000 });
+            reused = new URL(page.url()).pathname.replace(/\/$/, "") === path;
+          } catch {
+            reused = false;
+          }
+        }
+        if (!reused) await page.goto(new URL("/thread/new", origin).href, { waitUntil: "domcontentloaded", timeout: 30_000 });
         const input = page.locator("textarea").first();
         await input.waitFor({ state: "visible", timeout: 20_000 });
         // The composer mounts before the remote conversation finishes loading.
         await page.getByRole("log").waitFor({ state: "attached", timeout: 30_000 });
         await ensureAssignedSession(page, browser, config, context);
-        if (await page.locator('div[class*="hatch-chat-groupable-bubble"]').count()) {
+        if (!reused && await page.locator('div[class*="hatch-chat-groupable-bubble"]').count()) {
           throw new GatewayError("muse_thread", "New Muse thread contains previous messages.", 502);
         }
         // The upload precedes the baseline on purpose: the reference attached here is an existing attachment by then, so

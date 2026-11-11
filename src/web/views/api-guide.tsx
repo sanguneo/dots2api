@@ -210,6 +210,13 @@ function Guide({ settings, models, onReloadModels }: GuideProps) {
             다를 수 있습니다(응답의 size에 실제 크기, output_format에 실제 형식). 이미지 파일은 data/images에 남고 작업 상세에서 볼 수 있습니다.
           </li>
           <li>
+            <strong>thread (Muse 사이드 챗)</strong> 이미지·채팅 요청에 본문 필드 thread 또는 헤더 X-Muse-Thread(1~64자, A-Z a-z 0-9 . _ : -)를 넣으면 같은 키의 Muse 사이드 챗을 다시 열어 이어 씁니다. 형식이 틀리면 400(invalid_thread)이며 user 필드는 쓰지 않고 Dots 모델에서는 무시합니다.
+            키가 없으면 요청마다 새 사이드 챗을 씁니다. muse-image 사이드 챗은 같은 세션에 10분 동안 새 요청이 없으면 삭제되고(새 요청이 오면 10분이 다시 시작), muse-agent 채팅은 키가 없으면 작업이 성공한 직후 삭제하고 키가 있으면 7일 동안 쓰지 않을 때 삭제합니다.
+          </li>
+          <li>
+            <strong>provider_busy</strong> Dots가 이미 다른 작업을 하는 중이면 dots-agent와 dots-image 요청은 대기열에 쌓지 않고 바로 409(provider_busy)로 거절합니다. 메시지에 안내된 muse-image 또는 muse-agent로 바꿔 다시 요청하세요.
+          </li>
+          <li>
             <strong>도구 호출</strong> tools와 tool_choice는 프롬프트 기반 JSON 브리지로 지원합니다. 원격 에이전트가 작성한 호출을 OpenAI tool_calls로 돌려주며 실행은 OmO 같은 클라이언트가
             합니다(X-Dots2api-Tools: prompted). 네이티브 제약 디코딩이 아니어서 strict: true인 도구는 422(unsupported_parameter)로 거절하고, 형식이 맞지 않는 원격 응답은 다시 보내지 않고
             502(invalid_tool_response)로 끝냅니다.

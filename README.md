@@ -97,7 +97,16 @@ Muse has no official OAuth app, so a Muse account is connected by signing into m
 
 Either way the renewed session cookies are written back to the account, and the Muse self-heal renews the session and wakes the workspace VM before every job.
 
-Every `muse-image` job opens a new Muse thread, which the Muse app keeps as a side chat titled after the prompt. Turn the account's **keep context** switch off in the console to delete that side chat after a job succeeds. Deletion cannot be undone, so it is on (keep) by default; it only deletes the one row Muse marks as the open thread, and a failed or uncertain job leaves its side chat in place. The switch alone decides this: the old `DOTS2API_MUSE_PRUNE_THREADS` environment variable is no longer read.
+Every `muse-image` job opens a new Muse thread, which the Muse app keeps as a side chat titled after the prompt. Turn the account's **keep context** switch off in the console to delete that side chat after a job succeeds. Deletion cannot be undone, so it is on (keep) by default; it only deletes the one row Muse marks as the open thread, and a failed or uncertain job leaves its side chat in place. The old `DOTS2API_MUSE_PRUNE_THREADS` environment variable is no longer read. The side-chat rules below apply on top of the switch: with the switch off, every successful job still deletes its side chat at once.
+
+### Muse side chats, topic keys and busy Dots
+
+- **`thread` key.** `POST /v1/images/generations`, `/v1/images/edits` and `/v1/chat/completions` accept an optional `thread` (body field, or header `X-Muse-Thread`; 1-64 characters from `A-Za-z0-9._:-`; anything else is 400 `invalid_thread`). Requests with the same key reuse one Muse side chat (the gateway keeps the map per account in its database, and a keyed request goes back to the account that holds the chat); if that chat is gone, a new one starts. OpenAI's `user` field is not used for this, and Dots ignores the key.
+- **`muse-image`.** Every image side chat, keyed or not, is deleted after 10 minutes without a new request in the same session (a request on the same key renews the timer). A keyless request has a session of its own. Set `DOTS2API_MUSE_IMAGE_IDLE_SECONDS` to change the 600 s default.
+- **`muse-agent`.** Without a key, the side chat is deleted right after the job succeeds; with a key it is kept and deleted after 7 days without use.
+- Only side chats in the gateway's own map are deleted, through the same single-row path as above; a failed or uncertain job keeps its chat. Each deletion is logged without credentials.
+- **`provider_busy`.** While a Dot is running a job, `dots-agent` and `dots-image` requests are refused at once with 409 `provider_busy` (the message points to `muse-image` or `muse-agent`) instead of waiting in a queue. Muse still queues serially.
+- On start, accounts left in `error` are re-checked the way the console's Check button does.
 
 ### Chat
 

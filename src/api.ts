@@ -10,6 +10,7 @@ import { attachDotsLogin } from "./dots-login-routes";
 import { attachImageGeneration, IMAGE_MODELS } from "./images-api";
 import type { MuseLoginRoutes } from "./muse-login-routes";
 import type { DotsAuth } from "./dots-auth";
+import { parseThreadKey, THREAD_HEADER } from "./thread-key";
 
 const credentials = z.record(z.string().max(100), z.string().max(100_000));
 const createAccount = z.object({ provider: providerIdSchema, label: z.string().trim().min(1).max(80), credentials: credentials.default({}) });
@@ -21,6 +22,7 @@ const CHAT_MODELS = { "dots-agent": "dots", "muse-agent": "muse" } as const sati
 const chatInput = chatBridgeInputSchema.extend({
   model: z.enum(["dots-agent", "muse-agent"]),
   stream: z.boolean().default(false),
+  thread: z.string().optional(),
   response_format: z.unknown().optional(),
 });
 
@@ -165,7 +167,8 @@ export function createApi(gateway: Gateway, dotsAuth?: DotsAuth, museLogin?: Mus
     }
     const bridge = prepareChatBridge(body);
     for (const [name, value] of Object.entries(bridge.headers)) c.header(name, value);
-    const job = gateway.submit({ provider, prompt: bridge.prompt });
+    const thread = parseThreadKey(body.thread, c.req.header(THREAD_HEADER));
+    const job = gateway.submit({ provider, prompt: bridge.prompt, kind: "chat", ...(thread ? { thread } : {}) });
     c.header("X-Dots2api-Job-Id", job.id);
     c.header("X-Dots2api-Usage", "unknown");
     const result = await gateway.wait(job.id);

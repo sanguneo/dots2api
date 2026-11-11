@@ -2,10 +2,23 @@ import { GatewayError, jobIdSchema } from "./contracts";
 import type { Account, AccountId, Credentials, Job, JobId, ProviderAdapter, ProviderId, ProviderStatus, ReferenceImage } from "./contracts";
 import { validateReferenceImages } from "./images";
 import { Store } from "./store";
+import type { MuseThread } from "./store";
 import type { DotsAuth } from "./dots-auth";
 
 /** Work one account may hold (running plus waiting) before submit refuses with 429 instead of growing without bound. */
 const QUEUE_LIMIT = 20;
+
+/** Muse image side chats are deleted after this much idle time; chat side chats opened with a topic key after the second. */
+export const IMAGE_IDLE_MS = 600_000;
+export const CHAT_IDLE_MS = 7 * 24 * 3_600_000;
+export interface GatewayOptions {
+  /** A clock the idle rules read, so tests can move time without sleeping. */
+  readonly now?: () => number;
+  readonly imageIdleMs?: number;
+  readonly chatIdleMs?: number;
+}
+type SideChatKind = "image" | "chat";
+interface SideChat { readonly kind: SideChatKind; readonly thread?: string }
 
 export class Gateway {
   private readonly busy = new Set<AccountId>();
@@ -19,7 +32,21 @@ export class Gateway {
   /** One serial chain per account, so a job submitted while the account is busy runs after the current one. */
   private readonly chains = new Map<AccountId, Promise<void>>();
   private readonly depths = new Map<AccountId, number>();
-  constructor(readonly store: Store, readonly adapters: Readonly<Record<ProviderId, ProviderAdapter>>, private readonly dotsAuth?: DotsAuth) {}
+  private readonly now: () => number;
+  private readonly imageIdleMs: number;
+  private readonly chatIdleMs: number;
+  private readonly sweeping = new Set<string>();
+  private sweepTimer: ReturnType<typeof setInterval> | undefined;
+  constructor(
+    readonly store: Store,
+    readonly adapters: Readonly<Record<ProviderId, ProviderAdapter>>,
+    private readonly dotsAuth?: DotsAuth,
+    options: GatewayOptions = {},
+  ) {
+    this.now = options.now ?? Date.now;
+    this.imageIdleMs = options.imageIdleMs ?? IMAGE_IDLE_MS;
+    this.chatIdleMs = options.chatIdleMs ?? CHAT_IDLE_MS;
+  }
 
   private async credentials(id: AccountId, signal: AbortSignal): Promise<Credentials> {
     if (this.account(id).provider !== "dots" || !this.dotsAuth) return this.store.credentials(id);
@@ -56,6 +83,7 @@ export class Gateway {
     };
   }
   stop(): void {
+    clearInterval(this.sweepTimer);
     this.shutdown.abort();
     for (const id of [...this.leaseWaiters.keys()]) this.wakeLeaseWaiters(id);
   }
@@ -184,15 +212,117 @@ export class Gateway {
       return null;
     }
   }
-  submit(input: { readonly accountId?: AccountId; readonly provider?: ProviderId; readonly prompt: string; readonly referenceImages?: readonly ReferenceImage[] }): Job {
+  /** Runs account maintenance in the account's own serial order, so it never overlaps a job on the same browser profile. */
+  private enqueueMaintenance<T>(id: AccountId, work: () => Promise<T>): Promise<T> {
+    const previous = this.chains.get(id) ?? Promise.resolve();
+    const task = previous.then(async () => {
+      await this.waitForLease(id);
+      const done = Promise.withResolvers<void>();
+      this.leases.add(done.promise);
+      this.busy.add(id);
+      this.changed();
+      try { return await work(); }
+      finally {
+        this.busy.delete(id);
+        this.leases.delete(done.promise);
+        done.resolve();
+        this.changed();
+      }
+    });
+    const chained = task.then(() => undefined, () => undefined);
+    this.chains.set(id, chained);
+    void chained.then(() => { if (this.chains.get(id) === chained) this.chains.delete(id); });
+    return task;
+  }
+  private due(thread: MuseThread, now: number): boolean {
+    return now - thread.lastUsedAt >= (thread.kind === "image" ? this.imageIdleMs : this.chatIdleMs);
+  }
+  /**
+   * Deletes the Muse side chats that sat idle past their limit and returns how many were deleted. Only threads in the
+   * gateway's own map are ever touched, and a chat that cannot be deleted stays in the map for the next sweep.
+   */
+  async sweepThreads(): Promise<number> {
+    const due = this.store.museThreads().filter((thread) => this.due(thread, this.now()));
+    const outcomes = await Promise.all(due.map((thread) => {
+      const id = [thread.accountId, thread.kind, thread.key].join("\0");
+      if (this.sweeping.has(id)) return false;
+      this.sweeping.add(id);
+      return this.deleteIdleThread(thread).finally(() => this.sweeping.delete(id));
+    }));
+    return outcomes.filter(Boolean).length;
+  }
+  private deleteIdleThread(thread: MuseThread): Promise<boolean> {
+    return this.enqueueMaintenance(thread.accountId, async () => {
+      // A request that renewed the chat while this waited in line wins.
+      const current = this.store.museThread(thread.accountId, thread.kind, thread.key);
+      const account = this.store.account(thread.accountId);
+      const adapter = account ? this.adapters[account.provider] : undefined;
+      if (!current || !this.due(current, this.now()) || !account || !adapter?.deleteThread) return false;
+      if (!account.enabled || account.status !== "ready" || this.shutdown.signal.aborted) return false;
+      const label = `kind=${thread.kind} account=${account.id.slice(0, 8)} thread=${current.threadId}`;
+      try {
+        const signal = AbortSignal.any([this.shutdown.signal, AbortSignal.timeout(120_000)]);
+        const credentials = adapter.validate(await this.credentials(account.id, signal));
+        const outcome = await adapter.deleteThread(credentials, current.threadId, {
+          accountId: account.id, dataDir: this.store.dataDir, signal,
+          saveCredentials: (repaired) => { this.store.saveAccount(this.account(account.id), repaired); },
+        });
+        if (outcome === "failed") {
+          console.warn(`[muse-threads] delete failed, will retry ${label}`);
+          return false;
+        }
+        this.store.deleteMuseThread(thread.accountId, thread.kind, thread.key);
+        console.log(`[muse-threads] ${outcome === "gone" ? "already gone" : "deleted"} ${label}`);
+        return outcome === "deleted";
+      } catch {
+        console.warn(`[muse-threads] delete failed, will retry ${label}`);
+        return false;
+      }
+    });
+  }
+  /** Runs the idle sweep on a timer until stop(). */
+  startSweeper(intervalMs = 30_000): void {
+    clearInterval(this.sweepTimer);
+    this.sweepTimer = setInterval(() => { void this.sweepThreads().catch(() => undefined); }, intervalMs);
+    this.sweepTimer.unref();
+  }
+  /**
+   * Startup self-heal: an account left in error (for example by a restart that interrupted its job) is re-checked the way
+   * the console's Check button does, so it rejoins the rotation if its session still answers. Returns how many recovered.
+   */
+  async recheckErroredAccounts(): Promise<number> {
+    let recovered = 0;
+    for (const account of this.store.accounts().filter((a) => a.status === "error")) {
+      if (this.shutdown.signal.aborted) break;
+      try { if ((await this.check(account.id)).status === "ready") recovered++; }
+      catch { /* a busy account is skipped; the console still offers Check */ }
+    }
+    return recovered;
+  }
+  /**
+   * `kind` is set by the OpenAI-compatible routes only. It marks an API request: a Dots account that is already working
+   * refuses it at once (provider_busy) so the caller can switch to Muse, and a Muse request gets the side-chat rules.
+   * `thread` is the caller's topic key; it only means something to Muse.
+   */
+  submit(input: {
+    readonly accountId?: AccountId; readonly provider?: ProviderId; readonly prompt: string;
+    readonly referenceImages?: readonly ReferenceImage[]; readonly kind?: SideChatKind; readonly thread?: string;
+  }): Job {
     if (input.referenceImages) validateReferenceImages(input.referenceImages);
     // A snapshot, so a queued job still sends the bytes the caller submitted even if the caller's buffer is reused.
     const referenceImages = input.referenceImages?.map((image) => ({ mime: image.mime, data: new Uint8Array(image.data) }));
     const candidates = this.accounts()
       .filter((a) => a.provider === input.provider && a.enabled && a.status === "ready" && !this.leasesHeld.has(a.id));
+    if (input.kind && !input.accountId && input.provider === "dots" && candidates.length > 0 &&
+      candidates.every((a) => a.busy || this.depth(a.id) > 0)) {
+      throw new GatewayError("provider_busy", `Dots is busy with another job. Try ${input.kind === "image" ? "muse-image" : "muse-agent"} instead, or retry later.`, 409);
+    }
+    // A topic key goes back to the account that already holds its side chat.
+    const keyed = input.thread && input.kind && input.provider === "muse"
+      ? candidates.find((a) => this.store.museThread(a.id, input.kind!, input.thread!)) : undefined;
     const account = input.accountId
       ? this.account(input.accountId)
-      : candidates.filter((a) => !a.busy).sort((a, b) => (a.lastUsedAt ?? "").localeCompare(b.lastUsedAt ?? ""))[0]
+      : keyed ?? candidates.filter((a) => !a.busy).sort((a, b) => (a.lastUsedAt ?? "").localeCompare(b.lastUsedAt ?? ""))[0]
         // Every candidate is busy: join the shortest queue instead of refusing the work.
         ?? candidates.sort((a, b) => this.depth(a.id) - this.depth(b.id) || (a.lastUsedAt ?? "").localeCompare(b.lastUsedAt ?? ""))[0];
     if (!account) throw new GatewayError("no_account", "No connected account is available for this provider.", 503);
@@ -213,7 +343,8 @@ export class Gateway {
     this.store.saveJob(job);
     this.depths.set(account.id, this.depth(account.id) + 1);
     const previous = this.chains.get(account.id) ?? Promise.resolve();
-    const task = previous.then(() => this.startJob(job, referenceImages));
+    const side = input.kind ? { kind: input.kind, ...(input.thread ? { thread: input.thread } : {}) } : undefined;
+    const task = previous.then(() => this.startJob(job, referenceImages, side));
     const chained = task.then(() => undefined, () => undefined);
     this.chains.set(account.id, chained);
     // The promise a caller waits on covers the queued time as well as the run.
@@ -230,7 +361,7 @@ export class Gateway {
    * console keeps offering Check between queued jobs, and a job whose turn arrives after a restart or a quarantine is
    * failed honestly instead of being sent to a session that is no longer trusted.
    */
-  private async startJob(job: Job, referenceImages?: readonly ReferenceImage[]): Promise<Job> {
+  private async startJob(job: Job, referenceImages?: readonly ReferenceImage[], side?: SideChat): Promise<Job> {
     await this.waitForLease(job.accountId);
     try {
       const current = this.store.job(job.id) ?? job;
@@ -247,7 +378,7 @@ export class Gateway {
         // execute() re-saves this object when the provider accepts the work, so it must already read as running.
         const started = this.store.saveJob({ ...current, status: "running" });
         this.changed();
-        return await this.execute(started, referenceImages);
+        return await this.execute(started, referenceImages, side);
       } finally {
         this.busy.delete(job.accountId);
         this.leases.delete(done.promise);
@@ -269,8 +400,12 @@ export class Gateway {
     if (!job) throw new GatewayError("job_not_found", "Job not found.", 404);
     return job;
   }
-  private async execute(job: Job, referenceImages?: readonly ReferenceImage[]): Promise<Job> {
+  private async execute(job: Job, referenceImages?: readonly ReferenceImage[], side?: SideChat): Promise<Job> {
     let remoteId: string | null = null;
+    // Only Muse has side chats. A keyless request owns its chat: `job:<id>` can never match another request.
+    const sideChat = job.provider === "muse" ? side : undefined;
+    const key = sideChat ? sideChat.thread ?? `job:${job.id}` : undefined;
+    const reuse = sideChat?.thread && key ? this.store.museThread(job.accountId, sideChat.kind, key) : null;
     try {
       const signal = AbortSignal.any([this.shutdown.signal, AbortSignal.timeout(300_000)]);
       const credentials = this.adapters[job.provider].validate(await this.credentials(job.accountId, signal));
@@ -278,6 +413,8 @@ export class Gateway {
         accountId: job.accountId, dataDir: this.store.dataDir, signal,
         keepContext: this.store.account(job.accountId)?.keepContext ?? true,
         ...(referenceImages ? { referenceImages } : {}),
+        ...(reuse ? { threadId: reuse.threadId } : {}),
+        ...(sideChat ? { pruneAfter: sideChat.kind === "chat" && !sideChat.thread } : {}),
         saveCredentials: (repaired) => { this.store.saveAccount(this.account(job.accountId), repaired); },
         onAccepted: (id) => {
           remoteId = id;
@@ -295,6 +432,11 @@ export class Gateway {
           note = "\n\n[dots2api] The remote agent produced images, but they could not be saved locally.";
         }
         if (images.length < result.images.length && !note) note = `\n\n[dots2api] ${result.images.length - images.length} image(s) were not stored (unsupported type or too large).`;
+      }
+      // Only a finished job's side chat is tracked: a failed or uncertain one keeps its chat, untouched, as before.
+      // A keyless chat was already deleted by the worker; a failed deletion there leaves it for the operator.
+      if (sideChat && key && result.remoteId && (sideChat.kind === "image" || sideChat.thread)) {
+        this.store.saveMuseThread({ accountId: job.accountId, kind: sideChat.kind, key, threadId: result.remoteId, lastUsedAt: this.now() });
       }
       return this.store.saveJob({
         ...job, status: "completed", output: result.text + note, remoteId: result.remoteId, images, finishedAt: new Date().toISOString(),

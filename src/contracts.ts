@@ -102,10 +102,16 @@ export interface AdapterContext {
   readonly dataDir: string;
   readonly signal: AbortSignal;
   readonly referenceImages?: readonly ReferenceImage[];
+  /** Muse: reopen this existing side chat instead of starting a new one. Absent reads as "start a new thread". */
+  readonly threadId?: string | null;
+  /** Muse: delete the side chat this job just finished (a keyless chat request). Adds to the account's keepContext switch. */
+  readonly pruneAfter?: boolean;
   readonly onAccepted?: (remoteId: string | null) => void;
   /** Present when the caller can persist credentials an adapter repaired (for example a rebound thread). */
   readonly saveCredentials?: (credentials: Credentials) => void;
 }
+/** "gone": the side chat no longer exists remotely. "failed": nothing is known to have been deleted; try again later. */
+export type ThreadDeletion = "deleted" | "gone" | "failed";
 export interface ProviderAdapter {
   readonly info: ProviderInfo;
   /** Parse account configuration. Secrets are never returned by API reads. */
@@ -119,6 +125,8 @@ export interface ProviderAdapter {
    * a transient session problem heal without locking the account; an adapter without it keeps the plain quarantine.
    */
   reconnect?(credentials: Credentials, context: AdapterContext): Promise<CheckResult>;
+  /** Optional: delete one side chat this gateway opened. Must only ever touch that single thread. */
+  deleteThread?(credentials: Credentials, threadId: string, context: AdapterContext): Promise<ThreadDeletion>;
 }
 export class GatewayError extends Error {
   constructor(

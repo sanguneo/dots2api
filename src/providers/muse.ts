@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { GatewayError } from "../contracts";
-import type { AdapterContext, CheckResult, Credentials, ProviderAdapter, RunImage, RunResult } from "../contracts";
+import type { AdapterContext, CheckResult, Credentials, ProviderAdapter, RunImage, RunResult, ThreadDeletion } from "../contracts";
 import { createMuseAdapter as createBrowserAdapter, sanitizeDiagnostics } from "./muse/engine";
 
 const MAX_ATTEMPTS = 2;
@@ -41,6 +41,7 @@ const eventSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("accepted"), remoteId: z.string().nullable() }),
   z.object({ type: z.literal("credentials"), credentials: z.record(z.string(), z.string()) }),
   z.object({ type: z.literal("checked"), detail: z.string() }),
+  z.object({ type: z.literal("deleted"), outcome: z.enum(["deleted", "gone", "failed"]) }),
   z.object({ type: z.literal("completed"), text: z.string(), remoteId: z.string().nullable(), images: z.array(imageSchema).default([]) }),
   z.object({ type: z.literal("failed"), code: z.string(), message: z.string(), status: z.number(), uncertain: z.boolean() }),
 ]);
@@ -86,7 +87,7 @@ interface WorkerSettings {
 }
 
 async function callWorker(
-  operation: "check" | "run",
+  operation: "check" | "run" | "delete",
   settings: WorkerSettings,
   credentials: Credentials,
   prompt: string,
@@ -97,7 +98,7 @@ async function callWorker(
   const child = Bun.spawn([node, "--input-type=module", "--eval", await workerProgram()], {
     cwd: fileURLToPath(new URL("../../", import.meta.url)),
     stdin: new Blob([JSON.stringify({
-      operation, ...settings, credentials, prompt, accountId: context.accountId, dataDir: context.dataDir,
+      operation, ...settings, credentials, prompt, accountId: context.accountId, dataDir: context.dataDir, threadId: context.threadId ?? null,
       referenceImages: (context.referenceImages ?? []).map((image) => ({ mime: image.mime, dataB64: Buffer.from(image.data).toString("base64") })),
     })]),
     stdout: "pipe", stderr: "pipe",
@@ -129,6 +130,7 @@ async function callWorker(
           case "accepted": context.onAccepted?.(event.remoteId); break;
           case "credentials": context.saveCredentials?.(event.credentials); break;
           case "checked":
+          case "deleted":
           case "completed":
           case "failed": terminal = event; break;
         }
@@ -173,10 +175,10 @@ export function createMuseAdapter(site = "https://muse.ai", chatTimeout = 300_00
     return { detail: result.detail };
   };
   /**
-   * Muse starts a thread per job anyway, so the account's context switch alone decides whether the side chat it leaves
-   * is deleted: on keeps it, off deletes it. Deletion cannot be undone, so nothing else may turn it on behind the switch.
+   * A finished job deletes its own side chat when the gateway says so (`pruneAfter`: a keyless chat request) or the account's
+   * context switch is off (the older rule, kept as is). Deletion cannot be undone, so nothing else may turn it on.
    */
-  const runSettings = (context: AdapterContext): WorkerSettings => ({ ...settings, pruneThreads: context.keepContext === false });
+  const runSettings = (context: AdapterContext): WorkerSettings => ({ ...settings, pruneThreads: context.keepContext === false || context.pruneAfter === true });
   const runOnce = async (credentials: Credentials, prompt: string, context: AdapterContext): Promise<RunResult> => {
     const result = await callWorker("run", runSettings(context), credentials, prompt, context);
     if (result.type !== "completed") throw new GatewayError("muse_worker", "Unexpected Muse job result.", 502, true);
@@ -220,6 +222,12 @@ export function createMuseAdapter(site = "https://muse.ai", chatTimeout = 300_00
       throw lastError;
     },
     reconnect,
+    async deleteThread(credentials, threadId, context): Promise<ThreadDeletion> {
+      definition.validate(credentials);
+      const result = await callWorker("delete", settings, credentials, "", { ...context, threadId });
+      if (result.type !== "deleted") throw new GatewayError("muse_worker", "Unexpected Muse delete result.", 502);
+      return result.outcome;
+    },
   };
 }
 export const museAdapter = createMuseAdapter();

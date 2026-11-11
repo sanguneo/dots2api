@@ -4,7 +4,7 @@ import { MAX_IMAGES } from "../../images";
 import { createMuseAdapter } from "./engine";
 
 const requestSchema = z.object({
-  operation: z.enum(["check", "run"]),
+  operation: z.enum(["check", "run", "delete"]),
   site: z.url(),
   chatTimeout: z.number().positive(),
   credentials: z.record(z.string(), z.string()),
@@ -12,6 +12,7 @@ const requestSchema = z.object({
   dataDir: z.string(),
   prompt: z.string(),
   pruneThreads: z.boolean().default(false),
+  threadId: z.string().nullable().default(null),
   referenceImages: z.array(z.object({
     mime: z.enum(["image/png", "image/jpeg", "image/webp"]),
     dataB64: z.string().min(1),
@@ -27,7 +28,7 @@ try {
   const input = requestSchema.parse(JSON.parse(Buffer.concat(buffers).toString("utf8")));
   const adapter = createMuseAdapter(input.site, input.chatTimeout, input.pruneThreads);
   const context = {
-    accountId: input.accountId, dataDir: input.dataDir, signal: controller.signal,
+    accountId: input.accountId, dataDir: input.dataDir, signal: controller.signal, threadId: input.threadId,
     referenceImages: input.referenceImages.map((image) => ({ mime: image.mime, data: new Uint8Array(Buffer.from(image.dataB64, "base64")) })),
     onAccepted: (remoteId: string | null) => emit({ type: "accepted", remoteId }),
     saveCredentials: (credentials: Record<string, string>) => emit({ type: "credentials", credentials }),
@@ -36,6 +37,11 @@ try {
     case "check":
       emit({ type: "checked", ...await adapter.check(input.credentials, context) });
       break;
+    case "delete": {
+      if (!input.threadId || !adapter.deleteThread) throw new GatewayError("muse_worker", "Muse delete needs a thread id.", 400);
+      emit({ type: "deleted", outcome: await adapter.deleteThread(input.credentials, input.threadId, context) });
+      break;
+    }
     case "run": {
       const result = await adapter.run(input.credentials, input.prompt, context);
       emit({

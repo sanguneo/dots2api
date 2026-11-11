@@ -45,6 +45,20 @@ const jobSchema = z.object({
 const credentialsSchema = z.record(z.string(), z.string());
 type Row = { readonly body: string };
 
+/** A Muse side chat this gateway opened and still owns: the only threads it will ever reopen or delete. */
+export interface MuseThread {
+  readonly accountId: AccountId;
+  readonly kind: "image" | "chat";
+  readonly key: string;
+  readonly threadId: string;
+  /** Epoch milliseconds of the last request that used this side chat. */
+  readonly lastUsedAt: number;
+}
+type ThreadRow = { account_id: string; kind: "image" | "chat"; key: string; thread_id: string; last_used_at: number };
+const museThread = (row: ThreadRow): MuseThread => ({
+  accountId: accountIdSchema.parse(row.account_id), kind: row.kind, key: row.key, threadId: row.thread_id, lastUsedAt: row.last_used_at,
+});
+
 export class Store {
   readonly db: Database;
   readonly apiKey: string;
@@ -72,6 +86,10 @@ export class Store {
       CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, body TEXT NOT NULL, credentials TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, account_id TEXT NOT NULL, body TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS settings (name TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS muse_threads (
+        account_id TEXT NOT NULL, kind TEXT NOT NULL, key TEXT NOT NULL, thread_id TEXT NOT NULL, last_used_at INTEGER NOT NULL,
+        PRIMARY KEY (account_id, kind, key)
+      );
     `);
     const existing = this.db.query<{ value: string }, []>("SELECT value FROM settings WHERE name='api_key'").get();
     this.apiKey = existing?.value ?? `d2a_${randomBytes(32).toString("base64url")}`;
@@ -188,6 +206,22 @@ export class Store {
   }
   deleteAccount(id: AccountId): void {
     this.db.query("DELETE FROM accounts WHERE id=?").run(id);
+    this.db.query("DELETE FROM muse_threads WHERE account_id=?").run(id);
+  }
+  museThreads(): MuseThread[] {
+    return this.db.query<ThreadRow, []>("SELECT * FROM muse_threads").all().map(museThread);
+  }
+  museThread(accountId: AccountId, kind: MuseThread["kind"], key: string): MuseThread | null {
+    const row = this.db.query<ThreadRow, [string, string, string]>("SELECT * FROM muse_threads WHERE account_id=? AND kind=? AND key=?").get(accountId, kind, key);
+    return row ? museThread(row) : null;
+  }
+  saveMuseThread(thread: MuseThread): void {
+    this.db.query(`INSERT INTO muse_threads VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(account_id, kind, key) DO UPDATE SET thread_id=excluded.thread_id, last_used_at=excluded.last_used_at`)
+      .run(thread.accountId, thread.kind, thread.key, thread.threadId, thread.lastUsedAt);
+  }
+  deleteMuseThread(accountId: AccountId, kind: MuseThread["kind"], key: string): void {
+    this.db.query("DELETE FROM muse_threads WHERE account_id=? AND kind=? AND key=?").run(accountId, kind, key);
   }
   jobs(): Job[] {
     return this.db.query<Row, []>("SELECT body FROM jobs ORDER BY rowid DESC LIMIT 200").all()
