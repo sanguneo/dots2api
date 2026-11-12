@@ -470,7 +470,13 @@ export function createMuseAdapter(site = "https://muse.ai", chatTimeout = CHAT_T
         const images = await generatedImages(page, baseline);
         // An image-only answer has no agent text bubble, and waiting for one timed out after the image had arrived.
         const bubbles = page.locator('div[class*="hatch-agent-bubble-bg"]');
-        const text = await bubbles.count() ? await bubbles.last().innerText({ timeout: 5_000 }) : "";
+        const rawText = await bubbles.count() ? await bubbles.last().innerText({ timeout: 5_000 }) : "";
+        // innerText drops link targets (source chips show only their label), so append hrefs the text does not already contain.
+        const links: string[] = await bubbles.count()
+          ? await bubbles.last().evaluate((el) => [...el.querySelectorAll("a[href]")].map((a) => (a as HTMLAnchorElement).href).filter((h) => /^https?:/.test(h)))
+          : [];
+        const extraLinks = [...new Set(links)].filter((url) => !rawText.includes(url));
+        const text = extraLinks.length ? `${rawText.trim()}\n${extraLinks.join("\n")}` : rawText;
         if (!text.trim() && images.length === 0) throw new GatewayError("muse_result", "Muse finished without text or an image.", 502, true);
         const match = /^\/thread\/([^/]+)\/?$/.exec(new URL(page.url()).pathname);
         if (pruneThreads) await pruneCurrentThread(page);
