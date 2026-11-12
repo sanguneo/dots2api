@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { accountIdSchema, GatewayError } from "../src/contracts";
 import { createMuseAdapter } from "../src/providers/muse";
+import { fileBlock, resolveSourceUrl } from "../src/providers/muse/engine";
 
 const accountA = accountIdSchema.parse("11111111-1111-4111-8111-111111111111");
 const accountB = accountIdSchema.parse("22222222-2222-4222-8222-222222222222");
@@ -57,7 +58,7 @@ const html = `<!doctype html><html><body>
       body: JSON.stringify({ prompt: input.value, previews: document.querySelectorAll('[data-hatch-composer-chrome="true"] img[src^="blob:"]').length }),
     });
     document.querySelector("main").innerHTML =
-      '<div class="hatch-chat-groupable-bubble chat-user-bubble"></div>' +
+      '<div class="hatch-chat-groupable-bubble chat-user-bubble" data-message-item="true" data-message-role="user"></div>' +
       '<button aria-label="Stop">Stop</button>' +
       '<div class="hatch-chat-groupable-bubble hatch-agent-bubble-bg"></div>';
     document.querySelector(".chat-user-bubble").textContent = input.value;
@@ -79,6 +80,25 @@ const html = `<!doctype html><html><body>
         agent.innerHTML = '<div data-testid="hatch-chat-attachment-presentation-1"><img src="/media/result.png"></div>';
       } else if (input.value.startsWith("say")) {
         agent.innerHTML = "<p>First line.</p><p>Second line.</p>";
+      } else if (input.value.startsWith("source")) {
+        // Like the live page: the chip is a redirect link in its own assistant item, after a dangling label.
+        agent.textContent = "Sunny. \\uCD9C\\uCC98:";
+        document.querySelector("main").insertAdjacentHTML("beforeend", '<div data-message-item="true" data-message-role="assistant"><a href="https://l.meta.ai/?u=' + encodeURIComponent("https://example.com/weather?id=1\\u3010123\\u2020L1-L2\\u3011") + '&h=x">chip</a></div>');
+      } else if (input.value.startsWith("file")) {
+        // Like the live page: a file card whose icon is an image, opening a viewer whose menu downloads the real file.
+        agent.textContent = "Made it.";
+        document.querySelector("main").insertAdjacentHTML("beforeend", '<div data-message-item="true" data-message-role="assistant"><div data-testid="hatch-chat-attachment-presentation-file"><span data-testid="hatch-chat-file-card-aa" role="button" id="card"><img src="/media/result.png"><span title="memo.md">memo.md</span></span></div></div>');
+        document.getElementById("card").addEventListener("click", () => {
+          document.body.insertAdjacentHTML("beforeend", '<div id="panel"><button aria-label="More actions" id="more">m</button><button aria-label="Close" id="close">x</button></div>');
+          document.getElementById("close").addEventListener("click", () => document.getElementById("panel").remove());
+          document.getElementById("more").addEventListener("click", () => {
+            document.body.insertAdjacentHTML("beforeend", '<div role="menu"><div role="menuitem">Copy</div><div role="menuitem" id="dl">Download</div><div role="menuitem">Download as PDF</div></div>');
+            document.getElementById("dl").addEventListener("click", () => {
+              const link = document.createElement("a");
+              link.href = "/file/memo.md"; link.download = "memo.md"; document.body.append(link); link.click();
+            });
+          });
+        });
       } else {
         agent.textContent = "A complete answer";
       }
@@ -107,6 +127,9 @@ describe("Muse browser adapter", () => {
           return Response.json({ status: request.headers.get("cookie")?.includes("hatch_sess=valid") ? "assigned" : "anonymous" });
         }
         if (path === "/media/result.png") return new Response(png, { headers: { "content-type": "image/png" } });
+        if (path === "/file/memo.md") {
+          return new Response("# Memo\n\uD55C\uAE00", { headers: { "content-type": "application/octet-stream", "content-disposition": 'attachment; filename="memo.md"' } });
+        }
         // The hosted copy of an uploaded reference; any job that returns these bytes returned the user's own upload.
         if (path === "/media/reference.png") return new Response(referencePng, { headers: { "content-type": "image/png" } });
         if (path === "/upload") {
@@ -185,6 +208,27 @@ describe("Muse browser adapter", () => {
     expect(result.images?.[0]?.width).toBe(1);
     expect(result.images?.[0]?.height).toBe(1);
     expect(Buffer.from(result.images?.[0]?.data ?? []).equals(Buffer.from(png))).toBe(true);
+  }, 60_000);
+
+  it("appends the real address behind a source chip and drops the dangling label", async () => {
+    // Given a signed-in account whose answer ends in "출처:" with the chip's link in a separate assistant item.
+    const context = { accountId: accountA, dataDir, signal: new AbortController().signal };
+    await adapter.check({ cookieHeader: "hatch_sess=valid" }, context);
+    // When the agent answers.
+    const result = await adapter.run({}, "source please", context);
+    // Then the reply carries the unwrapped address, without the redirect or the citation marker.
+    expect(result.text).toBe("Sunny.\n\n출처: https://example.com/weather?id=1");
+  }, 60_000);
+
+  it("returns an attached file's real content instead of its icon as a picture", async () => {
+    // Given a signed-in account whose answer attaches a file card with an image icon.
+    const context = { accountId: accountA, dataDir, signal: new AbortController().signal };
+    await adapter.check({ cookieHeader: "hatch_sess=valid" }, context);
+    // When the agent answers.
+    const result = await adapter.run({}, "file please", context);
+    // Then no image is reported and the downloaded file travels in the reply.
+    expect(result.images).toBeUndefined();
+    expect(result.text).toBe('Made it.\n\n[[file name="memo.md" encoding="utf8"]]\n# Memo\n\uD55C\uAE00\n[[/file]]');
   }, 60_000);
 
   it("uploads reference images through the composer before the prompt is sent", async () => {
@@ -323,6 +367,21 @@ const threadsHtml = `<!doctype html><html><body>
     });
   }));
 </script></body></html>`;
+
+describe("Muse reply helpers", () => {
+  it("unwraps l.meta.ai redirects, cuts the citation marker and keeps only web addresses", () => {
+    const wrapped = (target: string) => `https://l.meta.ai/?u=${encodeURIComponent(target)}&h=abc`;
+    expect(resolveSourceUrl(wrapped("https://example.com/a?x=1\u3010853\u2020L32-L38\u3011"))).toBe("https://example.com/a?x=1");
+    expect(resolveSourceUrl("https://example.org/direct")).toBe("https://example.org/direct");
+    expect(resolveSourceUrl(wrapped("javascript:alert(1)"))).toBeNull();
+    expect(resolveSourceUrl("https://l.meta.ai/?h=abc")).toBeNull();
+  });
+
+  it("sends text files as utf8 and anything else as base64", () => {
+    expect(fileBlock('a"b.md', new TextEncoder().encode("hi"))).toBe('[[file name="a_b.md" encoding="utf8"]]\nhi\n[[/file]]');
+    expect(fileBlock("x.bin", Uint8Array.from([0xff, 0xfe, 0x00]))).toBe('[[file name="x.bin" encoding="base64"]]\n//4A\n[[/file]]');
+  });
+});
 
 describe("Muse side-chat pruning", () => {
   let dataDir: string;

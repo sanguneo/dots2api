@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { chromium } from "playwright";
 import type { BrowserContext, Page } from "playwright";
@@ -23,6 +24,12 @@ const ATTACHMENT_TIMEOUT = 10_000;
 /** References can total 32 MiB, so their upload gets its own, much longer, budget than a thumbnail read. */
 const REFERENCE_UPLOAD_TIMEOUT = 120_000;
 const MEDIA_LOAD_TIMEOUT = 10_000;
+/** A file card in the chat, never the composer or the user's own messages. */
+const FILE_CARD = '[data-testid^="hatch-chat-file-card-"]:not([data-hatch-composer-chrome] *):not([class*=chat-user-bubble] *)';
+const FILE_STEP_TIMEOUT = 8_000;
+const FILE_MAX_BYTES = 2 * 1024 * 1024;
+const FILE_MAX_COUNT = 3;
+const FILE_END = "[[/file]]";
 const VM_WAKE_TIMEOUT = 60_000;
 /** Muse's own authentication cookies; only these are persisted back to the account. */
 const ESSENTIAL_COOKIES = new Set(["hatch_sess", "hatch_gw", "hatch_vml", "hatch_native_auth_device"]);
@@ -176,6 +183,8 @@ function attachmentsInPage(): Attachment[] {
   const addElement = (element: Element | null, tid: string): void => {
     if (!element || seenElement.has(element)) return;
     seenElement.add(element);
+    // A file card shows a small type icon, not a picture; the file itself is fetched by `downloadFiles`.
+    if (tid.endsWith("-file") || element.querySelector('[data-testid^="hatch-chat-file-card-"]')) return;
     // The live composer has no <form>; it is marked data-hatch-composer-chrome and holds the user's own uploads.
     if (element.closest('form, [data-hatch-composer-chrome], [class*=chat-user-bubble], [class*="group/msg"]')) return;
     const video = element.querySelector("video") ?? (element.tagName === "VIDEO" ? element : null);
@@ -203,6 +212,71 @@ function attachmentsInPage(): Attachment[] {
     if (src && !src.includes("avatar") && !src.includes("emoji")) addElement(media.parentElement ?? media, "agent-media");
   });
   return list;
+}
+
+/**
+ * Runs inside the page. Muse renders source chips as links in their own assistant message item, outside the text bubble,
+ * so `innerText` never shows them. Returns the links of the assistant items that follow the last user message.
+ */
+function sourceLinksInPage(): string[] {
+  const items = [...document.querySelectorAll('[data-message-item="true"]')];
+  const lastUser = items.map((item) => item.getAttribute("data-message-role")).lastIndexOf("user");
+  if (lastUser < 0) return [];
+  return items.slice(lastUser + 1)
+    .filter((item) => item.getAttribute("data-message-role") === "assistant")
+    .flatMap((item) => [...item.querySelectorAll<HTMLAnchorElement>("a[href]")])
+    .filter((link) => !link.closest('[data-testid^="hatch-chat-file-card-"]') && link.hostname !== location.hostname)
+    .map((link) => link.href);
+}
+
+/** The page a source chip really points to: Muse wraps it in an l.meta.ai redirect and appends a citation marker. */
+export function resolveSourceUrl(href: string): string | null {
+  try {
+    const url = new URL(href);
+    const target = url.hostname === "l.meta.ai" ? url.searchParams.get("u") : href;
+    if (!target) return null;
+    const real = new URL(target.split("\u3010")[0] ?? "");
+    return real.protocol === "http:" || real.protocol === "https:" ? real.href : null;
+  } catch {
+    return null;
+  }
+}
+
+/** One attached file as a block the relay can cut out of the reply; non-text bytes travel as base64. */
+export function fileBlock(name: string, data: Uint8Array): string {
+  const text = Buffer.from(data).toString("utf8");
+  const plain = !text.includes("\uFFFD") && !text.includes(FILE_END);
+  const safeName = name.replace(/["\r\n]/g, "_");
+  return `[[file name="${safeName}" encoding="${plain ? "utf8" : "base64"}"]]\n${plain ? text : Buffer.from(data).toString("base64")}\n${FILE_END}`;
+}
+
+/**
+ * Fetches the files the agent attached this turn through Muse's own file viewer (card -> More actions -> Download), so the
+ * bytes are the real file rather than the rendered preview. A card that cannot be downloaded is reported, never skipped silently.
+ */
+async function downloadFiles(page: Page, knownCards: number): Promise<string[]> {
+  const cards = page.locator(FILE_CARD);
+  const total = await cards.count();
+  const blocks: string[] = [];
+  for (let index = knownCards; index < Math.min(total, knownCards + FILE_MAX_COUNT); index += 1) {
+    const card = cards.nth(index);
+    const title = await card.locator("[title]").first().getAttribute("title", { timeout: 2_000 }).catch(() => null) ?? `file-${index + 1}`;
+    try {
+      await card.click({ timeout: FILE_STEP_TIMEOUT });
+      await page.locator('button[aria-label="More actions"]').first().click({ timeout: FILE_STEP_TIMEOUT });
+      const [download] = await Promise.all([
+        page.waitForEvent("download", { timeout: FILE_STEP_TIMEOUT }),
+        page.getByRole("menuitem", { name: "Download", exact: true }).click({ timeout: FILE_STEP_TIMEOUT }),
+      ]);
+      const path = await download.path();
+      const data = new Uint8Array(await readFile(path));
+      blocks.push(data.byteLength > FILE_MAX_BYTES ? `[file ${title}: larger than ${FILE_MAX_BYTES} bytes, not attached]` : fileBlock(download.suggestedFilename() || title, data));
+    } catch {
+      blocks.push(`[file ${title}: download failed]`);
+    }
+    await page.locator('button[aria-label="Close"]').first().click({ timeout: 2_000 }).catch(() => {});
+  }
+  return blocks;
 }
 
 /** Runs inside the page: the bytes of one media URL as base64, so `blob:` and `data:` sources work too. */
@@ -436,6 +510,7 @@ export function createMuseAdapter(site = "https://muse.ai", chatTimeout = CHAT_T
         // A generated image must be new, not a history attachment or the user's own upload.
         const baseline = new Set((await page.evaluate(attachmentsInPage)).flatMap((attachment) => [attachment.src, attachment.vSrc, attachment.iSrc]).filter(Boolean));
         const baselineAttachments = await page.locator('[data-testid^="hatch-chat-attachment-presentation-"]').count();
+        const baselineFiles = await page.locator(FILE_CARD).count();
         // Observe the actual Stop control transition, not text stability or a silent timeout.
         await page.evaluate((knownAttachments: number) => {
           let seenStop = false;
@@ -471,12 +546,13 @@ export function createMuseAdapter(site = "https://muse.ai", chatTimeout = CHAT_T
         // An image-only answer has no agent text bubble, and waiting for one timed out after the image had arrived.
         const bubbles = page.locator('div[class*="hatch-agent-bubble-bg"]');
         const rawText = await bubbles.count() ? await bubbles.last().innerText({ timeout: 5_000 }) : "";
-        // innerText drops link targets (source chips show only their label), so append hrefs the text does not already contain.
-        const links: string[] = await bubbles.count()
-          ? await bubbles.last().evaluate((el) => [...el.querySelectorAll("a[href]")].map((a) => (a as HTMLAnchorElement).href).filter((h) => /^https?:/.test(h)))
-          : [];
-        const extraLinks = [...new Set(links)].filter((url) => !rawText.includes(url));
-        const text = extraLinks.length ? `${rawText.trim()}\n${extraLinks.join("\n")}` : rawText;
+        // innerText drops link targets (source chips are links outside the bubble), so list the ones the text lacks.
+        const sources = [...new Set((await page.evaluate(sourceLinksInPage)).map(resolveSourceUrl))]
+          .filter((url): url is string => url !== null && !rawText.includes(url));
+        // With the addresses attached, a bare "출처:" label left at the end of the text would only dangle.
+        const body = sources.length ? rawText.replace(/\s*(출처|Sources?)\s*[:：]\s*$/i, "").trim() : rawText.trim();
+        const files = await downloadFiles(page, baselineFiles);
+        const text = [body, ...sources.map((url) => `출처: ${url}`), ...files].filter(Boolean).join("\n\n");
         if (!text.trim() && images.length === 0) throw new GatewayError("muse_result", "Muse finished without text or an image.", 502, true);
         const match = /^\/thread\/([^/]+)\/?$/.exec(new URL(page.url()).pathname);
         if (pruneThreads) await pruneCurrentThread(page);
