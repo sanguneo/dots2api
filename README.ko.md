@@ -22,6 +22,42 @@
 
 [기능](#기능) · [설치](#설치) · [사용법](#사용법) · [동작 방식](#동작-방식) · [저장소 구조](#저장소-구조) · [현재 한계](#현재-한계) · [라이선스](#라이선스)
 
+## 빠른 시작: 대화·이미지·에이전트 스킬
+
+[yelixir-dev/dots2api](https://github.com/yelixir-dev/dots2api)를 포크해
+대화, 이미지 생성·편집, 선택형 [텔레그램 연결](docs/telegram.md)을 함께 제공합니다.
+각자 본인의 Dots·Muse 계정을 연결해서 씁니다.
+
+```bash
+git clone https://github.com/sanguneo/dots2api.git
+cd dots2api
+bun install --frozen-lockfile
+bash install-skill.sh
+```
+
+이미 dots2api 서버가 있다면, 본인 서버 주소와 API 키를 담은 개인 파일을 설정하세요.
+
+```bash
+bun ~/.agents/skills/dots2api/scripts/client.js configure --base-url http://127.0.0.1:3010 --key-file /private/dots2api-key.txt
+bun ~/.agents/skills/dots2api/scripts/client.js models
+bun ~/.agents/skills/dots2api/scripts/client.js chat --session my-topic --prompt "안녕"
+bun ~/.agents/skills/dots2api/scripts/client.js chat --session my-topic --prompt "그 이야기 이어서 해줘" --save-dir ./answers
+bun ~/.agents/skills/dots2api/scripts/client.js image --model muse-image --prompt "새벽의 조용한 서점" --out ./bookshop
+bun ~/.agents/skills/dots2api/scripts/client.js image --model dots-image --image ./bookshop.webp --prompt "구도는 유지하고 눈만 내리게 해줘" --out ./edited
+```
+
+이미지 명령이 출력하는 JSON의 `files`에서 실제 저장 경로를 확인한 뒤 다음 참조로
+쓰세요. 제공자가 PNG·JPEG·WebP 중 다른 형식을 돌려줄 수 있습니다.
+이름 붙인 `--session` 대화는 Muse에 적용되고, Dots는 본인 기본 Dot 대화를 씁니다.
+긴 프롬프트는 `--prompt-file`로 전달합니다. 생성 요청은 자동 재시도하지 않습니다.
+
+서버도 직접 운영하려면 아래 [설치](#설치)를 따라 웹 콘솔에서 본인 계정을 로그인하고,
+API 안내의 키를 개인 파일에 저장하면 됩니다. 로그인 승인은 직접 해야 합니다.
+설치된 스킬에는 키가 없고, 소스 폴더 없이도 실행됩니다. 에이전트의 스킬 폴더가
+다르면 `bash install-skill.sh --dir /해당/skills/dots2api`로 지정하세요.
+[스킬 설명](skills/dots2api/SKILL.md)에서 대화·이미지·오류 처리 흐름을 확인할 수 있습니다.
+텔레그램은 선택 기능이며, 스킬을 설치했다고 봇이 자동으로 켜지지는 않습니다.
+
 ## 기능
 
 - **OpenAI 방식 채팅.** `muse-agent`는 대화를 내 muse.ai 계정의 Muse 컴포저로 보내고 에이전트의 답변 텍스트를 돌려줍니다(`stream: true`도 버퍼링해 전달). 도구 브리지가 없어 `tools`는 400(`unsupported_parameter`)으로 거절하며, Muse가 이미지로 답하면 저장된 작업 이미지의 마크다운 링크가 답변에 들어가고 이미지만 있는 답도 타임아웃이 아닙니다. 계정의 대화 유지 스위치는 `muse-image`와 같게 동작합니다. `dots-agent`로 `POST /v1/chat/completions`를 호출하며, `tools`와 `tool_choice`는 프롬프트 기반 JSON 브리지로 동작하고 반환된 호출은 클라이언트(예: OmO)가 실행합니다.
@@ -35,15 +71,23 @@
 
 ## 설치
 
-사용자 systemd가 있는 Linux와 Bun 1.3 이상이 필요합니다. 설치 스크립트는 루트 권한이 필요 없고 빌드 없이 런타임 의존성만 설치합니다.
+사용자 systemd가 있는 Linux와 Bun 1.3 이상이 필요합니다. 설치 스크립트는 루트 권한
+없이 런타임 의존성을 설치하고 공용 클라이언트 스킬을 묶어 줍니다. Muse는 Node.js
+22 이상·Chromium이 추가로 필요하고 헤드리스 로그인에는 Xvfb도 필요합니다.
 
 ```bash
-git clone https://github.com/yelixir-dev/dots2api.git
+git clone https://github.com/sanguneo/dots2api.git
 cd dots2api
-./install.sh --port 3010
+bash install.sh --port 3010
 ```
 
 설치 스크립트는 프로그램을 `~/.local/share/dots2api/app`에 복사하고, 데이터는 `~/.local/share/dots2api/data`에 두며, `dots2api`라는 사용자 서비스를 켭니다. 다시 실행하면 데이터는 건드리지 않고 프로그램만 갱신해 서비스를 재시작합니다. 로그인해 두지 않는 서버에서는 서비스가 계속 돌도록 `sudo loginctl enable-linger "$USER"`를 한 번 실행하세요.
+
+스킬은 `~/.agents/skills/dots2api`에 설치합니다(`--skill-dir 경로`로 변경).
+`--with-muse`를 주면 Node.js·Xvfb를 점검하고 잠금파일에 고정된 Chromium을 받습니다.
+시스템 라이브러리는 아래 Muse 계정 연결 안내대로 먼저 준비하세요. 설치 스크립트가
+sudo를 자동 실행하지는 않습니다. `--no-start`는 파일만 설치하고 서비스를 켜거나
+다시 읽지 않습니다.
 
 설치 대신 소스 체크아웃에서 바로 실행하려면 다음과 같이 합니다.
 

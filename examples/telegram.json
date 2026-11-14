@@ -1,0 +1,18 @@
+{
+  "gateway": {
+    "baseURL": "http://127.0.0.1:3010",
+    "apiKey": { "env": "DOTS2API_API_KEY" }
+  },
+  "telegram": {
+    "botToken": { "file": "./telegram-token.txt" },
+    "apiBaseURL": "https://api.telegram.org"
+  },
+  "allowedUserIds": [123456789],
+  "allowedChatIds": [],
+  "allowBotMessages": false,
+  "model": "muse-agent",
+  "systemPrompt": "You are a helpful assistant.",
+  "stateDir": "./telegram-state",
+  "requestTimeoutMs": 300000,
+  "pollTimeoutSeconds": 25
+}

@@ -16,6 +16,8 @@ SERVICE_FILE="$USER_UNIT_DIR/dots2api.service"
 
 PORT="$DEFAULT_PORT"
 NO_START=0
+WITH_MUSE=0
+SKILL_DIR="$HOME/.agents/skills/dots2api"
 
 usage() {
   cat <<'USAGE'
@@ -27,6 +29,8 @@ Usage:
 Options:
   --port PORT   Listen port. Default: 3010 (the server always binds 127.0.0.1)
   --no-start    Install files and the service but do not enable or start it
+  --with-muse   Check Node.js/Xvfb and install the pinned Chromium browser
+  --skill-dir P Install the bundled client skill into P
   -h, --help    Show this help
 
 Layout:
@@ -51,6 +55,15 @@ while [ "$#" -gt 0 ]; do
     --no-start)
       NO_START=1
       shift
+      ;;
+    --with-muse)
+      WITH_MUSE=1
+      shift
+      ;;
+    --skill-dir)
+      [ "$#" -ge 2 ] || fail "--skill-dir requires a path"
+      SKILL_DIR="$2"
+      shift 2
       ;;
     -h|--help)
       usage
@@ -102,6 +115,11 @@ fi
 
 command -v systemctl >/dev/null 2>&1 || fail "required command not found: systemctl"
 
+if [ "$WITH_MUSE" -eq 1 ]; then
+  [ -n "$NODE_MAJOR" ] && [ "$NODE_MAJOR" -ge 22 ] || fail "Muse needs Node.js 22+. Install it and retry --with-muse."
+  command -v Xvfb >/dev/null 2>&1 || fail "Muse remote login needs Xvfb. Debian/Ubuntu: sudo apt install -y xvfb. Then retry --with-muse."
+fi
+
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ ! -f "$SOURCE_DIR/package.json" ] || ! grep -q '"name": "dots2api"' "$SOURCE_DIR/package.json"; then
   fail "run this script from the dots2api source checkout"
@@ -147,6 +165,10 @@ touch "$INSTALL_MARKER"
 
 log "Installing runtime dependencies with bun"
 (cd "$INSTALL_DIR" && "$BUN_BIN" install --frozen-lockfile --production)
+if [ "$WITH_MUSE" -eq 1 ]; then
+  (cd "$INSTALL_DIR" && "$BUN_BIN" x --no-install playwright install chromium)
+fi
+bash "$INSTALL_DIR/install-skill.sh" --dir "$SKILL_DIR"
 
 cat > "$SERVICE_FILE" <<UNIT
 [Unit]

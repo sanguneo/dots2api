@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "bun --watch src/server.ts",
     "start": "bun src/server.ts",
+    "client": "bun src/client/cli.ts",
+    "telegram": "bun src/telegram/main.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit"
   },

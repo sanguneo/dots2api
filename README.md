@@ -22,6 +22,44 @@
 
 [What it does](#what-it-does) · [Install](#install) · [Usage](#usage) · [How it works](#how-it-works) · [Repository layout](#repository-layout) · [Current limitations](#current-limitations) · [License](#license)
 
+## Quick start: chat, images and an agent skill
+
+This fork of [yelixir-dev/dots2api](https://github.com/yelixir-dev/dots2api)
+packages conversation, image generation/editing and an optional
+[Telegram relay](docs/telegram.md). Every user connects their own accounts.
+
+```bash
+git clone https://github.com/sanguneo/dots2api.git
+cd dots2api
+bun install --frozen-lockfile
+bash install-skill.sh
+```
+
+If you already have a dots2api server, configure the installed client with your
+server URL and a private file containing **your** gateway API key:
+
+```bash
+bun ~/.agents/skills/dots2api/scripts/client.js configure --base-url http://127.0.0.1:3010 --key-file /private/dots2api-key.txt
+bun ~/.agents/skills/dots2api/scripts/client.js models
+bun ~/.agents/skills/dots2api/scripts/client.js chat --session my-topic --prompt "Hello"
+bun ~/.agents/skills/dots2api/scripts/client.js chat --session my-topic --prompt "Continue that idea." --save-dir ./answers
+bun ~/.agents/skills/dots2api/scripts/client.js image --model muse-image --prompt "A quiet bookshop at dawn" --out ./bookshop
+bun ~/.agents/skills/dots2api/scripts/client.js image --model dots-image --image ./bookshop.webp --prompt "Keep the scene; add falling snow." --out ./edited
+```
+
+The `image` command reports actual saved paths and extensions in JSON; use that
+path as the next reference, since providers may return PNG, JPEG or WebP.
+Named conversations apply to Muse; Dots uses its own primary Dot conversation.
+Use `--prompt-file` for long prompts. Generation is not automatically retried.
+
+For your own server, follow [Install](#install), connect your Dots/Muse account
+in the web console, then copy the key from API guide into a private file.
+The installed skill contains no credentials and runs without the source checkout.
+Use `bash install-skill.sh --dir /your/agent/skills/dots2api` for another agent's
+skill directory. The bundled skill instructions are in [SKILL.md](skills/dots2api/SKILL.md).
+Telegram is optional and has separate user/chat allowlists; installing a skill
+does not silently start a bot.
+
 ## What it does
 
 - **OpenAI-style chat.** `POST /v1/chat/completions` with `dots-agent`; `tools` and `tool_choice` work through a prompt-based JSON bridge, and the returned calls are executed by your client (for example OmO). `muse-agent` sends the conversation through the Muse composer of your muse.ai account and returns the agent's reply text (non-streaming result, `stream: true` is delivered buffered); it has no tool bridge, so `tools` is rejected with 400 (`unsupported_parameter`). If Muse answers with an image, the reply holds a markdown link to the stored job image, and an image-only answer is not a timeout. The account's keep-context switch behaves as for `muse-image`.
@@ -35,15 +73,23 @@
 
 ## Install
 
-Requires Linux with user systemd and Bun 1.3 or later. The installer needs no root, builds nothing, and installs runtime dependencies only.
+Requires Linux with user systemd and Bun 1.3 or later. The installer needs no root,
+installs runtime dependencies and bundles the portable client skill. Muse additionally
+requires Node.js 22+, Chromium and Xvfb for its headless login.
 
 ```bash
-git clone https://github.com/yelixir-dev/dots2api.git
+git clone https://github.com/sanguneo/dots2api.git
 cd dots2api
-./install.sh --port 3010
+bash install.sh --port 3010
 ```
 
 The installer copies the program to `~/.local/share/dots2api/app`, keeps data in `~/.local/share/dots2api/data`, and enables a user service named `dots2api`. Re-running it updates the program and restarts the service without touching data. On a server that you do not stay logged in to, run `sudo loginctl enable-linger "$USER"` once so the service keeps running.
+
+It also installs the skill in `~/.agents/skills/dots2api` (override with
+`--skill-dir PATH`). `--with-muse` checks Node.js/Xvfb and downloads the project's
+pinned Chromium; install system libraries as described under Connect a Muse
+account first. The installer never runs sudo. `--no-start` writes files without
+starting or reloading the service.
 
 To run from the source checkout instead:
 
