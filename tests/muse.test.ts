@@ -74,6 +74,8 @@ const html = `<!doctype html><html><body>
       }
     }
     if (input.value === "partial") document.querySelector('[aria-label="Stop"]').remove();
+    // Like the live agent side panel: a background task keeps its own Stop control after the reply finishes.
+    if (input.value.startsWith("busy")) document.body.insertAdjacentHTML("beforeend", '<aside><button aria-label="Stop task">Stop task</button></aside>');
     queueMicrotask(() => {
       const agent = document.querySelector(".hatch-agent-bubble-bg");
       if (input.value.startsWith("draw")) {
@@ -303,6 +305,16 @@ describe("Muse browser adapter", () => {
     expect(result.remoteId).toBe("synthetic-123");
     expect(result.text).toContain("[dots2api]");
     expect(result.text).toContain("retried once");
+  }, 90_000);
+
+  it("completes a reply while a side-panel background task keeps its Stop task control", async () => {
+    // Given a signed-in account whose agent panel shows a still-running background task.
+    const context = { accountId: accountA, dataDir, signal: new AbortController().signal };
+    await adapter.check({ cookieHeader: "hatch_sess=valid" }, context);
+    // When a chat reply finishes while that task's Stop task button stays on the page.
+    const result = await adapter.run({}, "busy side task", context);
+    // Then the reply is confirmed from the composer's own Stop transition.
+    expect(result.text).toContain("A complete answer");
   }, 90_000);
 
   it("never returns partial text without a confirmed completion transition", async () => {

@@ -517,7 +517,8 @@ export function createMuseAdapter(site = "https://muse.ai", chatTimeout = CHAT_T
           const root = document.documentElement;
           const stopSelector = '[data-testid="hatch-composer-stop-button"], button[aria-label*="Stop" i], button[aria-label*="\u{505c}\u{6b62}"]';
           const observe = () => {
-            const stop = document.querySelector(stopSelector);
+            // Skip the side panel's "Stop task" buttons: a running background task must not hide the reply's own Stop transition.
+            const stop = [...document.querySelectorAll(stopSelector)].find((el) => !/task|\u{4efb}\u{52a1}/iu.test(el.getAttribute("aria-label") ?? "")) ?? null;
             if (stop) seenStop = true;
             if (root.dataset["museComplete"] === "true" || !seenStop || stop) return;
             if (!document.querySelector('div[class*="chat-user-bubble"]')) return;
