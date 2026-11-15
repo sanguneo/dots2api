@@ -164,7 +164,7 @@ async function callWorker(
   }
 }
 
-export function createMuseAdapter(site = "https://muse.ai", chatTimeout = 300_000): ProviderAdapter {
+export function createMuseAdapter(site = "https://muse.ai", chatTimeout = 600_000): ProviderAdapter {
   const definition = createBrowserAdapter(site, chatTimeout);
   const settings: WorkerSettings = { site, chatTimeout, pruneThreads: false };
   /** Re-verifies the account's session: the same work the console's Check button performs. */

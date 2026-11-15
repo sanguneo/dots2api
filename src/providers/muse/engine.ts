@@ -17,7 +17,7 @@ const importedCookies = z.union([
   z.record(z.string(), z.string()),
   z.array(z.object({ name: z.string(), value: z.string(), domain: z.string().optional() })),
 ]);
-const CHAT_TIMEOUT = 300_000;
+const CHAT_TIMEOUT = 600_000;
 /** A thread id goes into a URL path, so only the characters Muse itself uses are allowed. */
 const THREAD_ID = /^[A-Za-z0-9_-]{1,128}$/;
 const ATTACHMENT_TIMEOUT = 10_000;

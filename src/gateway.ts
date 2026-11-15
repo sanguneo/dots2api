@@ -407,7 +407,7 @@ export class Gateway {
     const key = sideChat ? sideChat.thread ?? `job:${job.id}` : undefined;
     const reuse = sideChat?.thread && key ? this.store.museThread(job.accountId, sideChat.kind, key) : null;
     try {
-      const signal = AbortSignal.any([this.shutdown.signal, AbortSignal.timeout(300_000)]);
+      const signal = AbortSignal.any([this.shutdown.signal, AbortSignal.timeout(660_000)]);
       const credentials = this.adapters[job.provider].validate(await this.credentials(job.accountId, signal));
       const result = await this.adapters[job.provider].run(credentials, job.prompt, {
         accountId: job.accountId, dataDir: this.store.dataDir, signal,
