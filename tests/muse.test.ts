@@ -359,6 +359,7 @@ const threadsHtml = `<!doctype html><html><body>
       document.querySelector('[aria-label="Stop"]').remove();
       history.replaceState(null, "", "/thread/side-1");
       if (!input.value.includes("unmarked")) document.querySelector('[data-title="Current"]').setAttribute("aria-current", "page");
+      if (input.value.includes("collapsed")) collapseThreads();
     });
   });
   let target = null;
@@ -378,6 +379,24 @@ const threadsHtml = `<!doctype html><html><body>
       });
     });
   }));
+  // Muse unmounts all rows while its side-chat panel is closed.
+  const rows = [...document.querySelectorAll('[data-testid="hatch-thread-row"]')];
+  function collapseThreads() {
+    rows.forEach((row) => row.remove());
+    const switcher = document.createElement("button");
+    switcher.dataset.testid = "hatch-chat-switcher-trigger";
+    switcher.textContent = "Open chats";
+    switcher.addEventListener("click", () => {
+      document.querySelector("nav").append(...rows);
+      switcher.remove();
+    });
+    document.body.append(switcher);
+  }
+  if (location.pathname !== "/thread/new") {
+    if (!location.pathname.includes("unmarked")) rows[1].setAttribute("aria-current", "page");
+    if (location.pathname.includes("ambiguous")) rows[0].setAttribute("aria-current", "page");
+    if (location.pathname.includes("collapsed")) collapseThreads();
+  }
 </script></body></html>`;
 
 describe("Muse reply helpers", () => {
@@ -412,7 +431,9 @@ describe("Muse side-chat pruning", () => {
         const path = new URL(request.url).pathname;
         if (path === "/api/session") return Response.json({ status: "assigned" });
         if (path.startsWith("/deleted/")) { deleted.push(decodeURIComponent(path.slice("/deleted/".length))); return new Response("ok"); }
-        if (path === "/thread/new") return new Response(threadsHtml, { headers: { "content-type": "text/html" } });
+        if (path === "/thread/gone") return Response.redirect(new URL("/thread/new", request.url));
+        if (path === "/thread/redirected") return Response.redirect(new URL("/login", request.url));
+        if (path.startsWith("/thread/") || path === "/login") return new Response(threadsHtml, { headers: { "content-type": "text/html" } });
         return new Response("gone", { headers: { "content-type": "text/html" } });
       },
     });
@@ -467,6 +488,31 @@ describe("Muse side-chat pruning", () => {
     // Then the job still succeeds and no row is guessed at.
     expect(result).toEqual({ text: "Done", remoteId: "side-1" });
     expect(deleted).toEqual([]);
+  }, 60_000);
+
+  it("prunes the completed job when the side-chat panel is collapsed", async () => {
+    // Given a completed job whose current row is unmounted until Open chats is clicked.
+    deleted.length = 0;
+    const result = await adapter.run({}, "hello collapsed", context(false));
+    expect(result).toEqual({ text: "Done", remoteId: "side-1" });
+    expect(deleted).toEqual(["Current"]);
+  }, 60_000);
+
+  it.each([
+    ["side-1", "deleted", ["Current"]],
+    ["collapsed", "deleted", ["Current"]],
+    ["ambiguous-collapsed", "failed", []],
+    ["unmarked-collapsed", "failed", []],
+    ["gone", "gone", []],
+    ["redirected", "failed", []],
+    ["../invalid", "failed", []],
+  ] as const)("sweeper deletion of %s returns %s without deleting another thread", async (threadId, outcome, expectedDeleted) => {
+    // Given a local Muse page with the requested panel/selection or redirect state.
+    deleted.length = 0;
+    if (!adapter.deleteThread) throw new Error("Muse adapter must support thread deletion.");
+    const result = await adapter.deleteThread({}, threadId, context(true));
+    expect(result).toBe(outcome);
+    expect(deleted).toEqual([...expectedDeleted]);
   }, 60_000);
 });
 
