@@ -98,7 +98,7 @@ export function createApi(gateway: Gateway, dotsAuth?: DotsAuth, museLogin?: Mus
   app.delete("/api/muse-threads/:key", async (c) => {
     const key = parseThreadKey(c.req.param("key"), undefined);
     // Route parameters are always present; parsing applies the same contract as creation.
-    if (key === undefined) throw new GatewayError("invalid_thread", "A thread key is required.", 400);
+    if (key === undefined || !key.startsWith("w-")) throw new GatewayError("invalid_thread", "Only worker thread keys starting with w- can be deleted.", 400);
     const result = await gateway.museThreads.deleteKey(key);
     return c.json(result, result.threads.some((thread) => thread.status === "failed") ? 502 : 200);
   });

@@ -11,7 +11,7 @@ import { Store } from "../src/store";
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const cleanup of cleanups.splice(0).reverse()) cleanup(); });
 
-function fixture(options: { run?: ProviderAdapter["run"]; deletion?: ThreadDeletion | "throw" } = {}) {
+function fixture(options: { run?: ProviderAdapter["run"]; deletion?: ThreadDeletion | "throw"; deleteThread?: ProviderAdapter["deleteThread"] } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "dots2api-delete-"));
   const store = new Store(dir);
   const remote = new Set<string>();
@@ -28,12 +28,12 @@ function fixture(options: { run?: ProviderAdapter["run"]; deletion?: ThreadDelet
       context.onAccepted?.(remoteId);
       return { text: "fake answer", remoteId };
     }),
-    deleteThread: async (_credentials, id) => {
+    deleteThread: options.deleteThread ?? (async (_credentials, id) => {
       if (options.deletion === "throw") throw new Error("private upstream detail");
       if (options.deletion === "failed") return "failed";
       const existed = remote.delete(id);
       return options.deletion ?? (existed ? "deleted" : "gone");
-    },
+    }),
   });
   const gateway = new Gateway(store, { dots: adapter("dots"), muse: adapter("muse") });
   cleanups.push(() => { gateway.stop(); store.close(); rmSync(dir, { recursive: true, force: true }); });
@@ -118,6 +118,77 @@ test.each(["bad%20key", "x".repeat(65)])("rejects invalid deletion keys: %s", as
   expect((await response.json()).error.code).toBe("invalid_thread");
 });
 
+test.each(["tg123", "topic", "W-task"])("rejects non-worker deletion key %s and preserves its remote chat", async (key) => {
+  const f = fixture();
+  await f.ready();
+  await f.ask(key);
+  const response = await f.remove(key);
+  expect(response.status).toBe(400);
+  expect((await response.json()).error.code).toBe("invalid_thread");
+  expect([...f.remote]).toEqual(["thread-1"]);
+  expect(f.store.museThreads().map((thread) => thread.key)).toEqual([key]);
+});
+
+test.each(["failed", "throw"] as const)("retries replaced thread after %s deletion and storage restart", async (failure) => {
+  const started = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  let failOld = true;
+  const f = fixture({
+    run: async (_credentials, _prompt, context) => {
+      started.resolve();
+      await release.promise;
+      f.remote.add("new");
+      context.onAccepted?.("new");
+      return { text: "answer", remoteId: "new" };
+    },
+    deleteThread: async (_credentials, id) => {
+      if (id === "old" && failOld) {
+        if (failure === "throw") throw new Error("private deletion failure");
+        return "failed";
+      }
+      return f.remote.delete(id) ? "deleted" : "gone";
+    },
+  });
+  const account = await f.ready();
+  f.remote.add("old");
+  f.store.saveMuseThread({ accountId: account.id, kind: "chat", key: "w-task", threadId: "old", lastUsedAt: Date.now() });
+  const running = f.ask();
+  await started.promise;
+  const deleting = f.remove();
+  release.resolve();
+  await running;
+  const first = await deleting;
+  expect(first.status).toBe(502);
+  expect((await first.json()).threads.map((thread: { threadId: string; status: string }) => [thread.threadId, thread.status]).sort())
+    .toEqual([["new", "deleted"], ["old", "failed"]]);
+  f.gateway.stop();
+  const reopened = new Store(f.dir);
+  const restarted = new Gateway(reopened, f.gateway.adapters);
+  try {
+    failOld = false;
+    const response = await createApi(restarted).request("http://localhost/api/muse-threads/w-task", { method: "DELETE", headers: f.headers });
+    expect((await response.json()).threads.map((thread: { threadId: string; status: string }) => [thread.threadId, thread.status]))
+      .toEqual([["old", "deleted"]]);
+    expect([...f.remote]).toEqual([]);
+    expect(reopened.museThreads()).toEqual([]);
+  } finally { restarted.stop(); reopened.close(); }
+});
+
+test("retains every replacement made before DELETE starts", async () => {
+  const f = fixture({ run: async (_credentials, _prompt, context) => {
+    for (const id of ["intermediate", "new"]) { f.remote.add(id); context.onAccepted?.(id); }
+    return { text: "answer", remoteId: "new" };
+  } });
+  const account = await f.ready();
+  f.remote.add("old");
+  f.store.saveMuseThread({ accountId: account.id, kind: "chat", key: "w-task", threadId: "old", lastUsedAt: Date.now() });
+  await f.ask();
+  const response = await f.remove();
+  expect((await response.json()).threads.map((thread: { threadId: string }) => thread.threadId).sort())
+    .toEqual(["intermediate", "new", "old"]);
+  expect([...f.remote]).toEqual([]);
+});
+
 test("cleanup waits for queued late creation and excludes new work using that key", async () => {
   const started = Promise.withResolvers<void>();
   const release = Promise.withResolvers<void>();
@@ -149,14 +220,16 @@ test("cleanup waits for queued late creation and excludes new work using that ke
 });
 
 test("accepted failed chats remain discoverable for cleanup after reopening storage", async () => {
+  const retryFlags: (boolean | undefined)[] = [];
   const f = fixture({ run: async (_credentials, _prompt, context) => {
+    retryFlags.push(context.retryAccepted);
     f.remote.add("accepted-worker");
     context.onAccepted?.("accepted-worker");
-    if (context.retryAccepted !== false) throw new Error("Keyed work must not be replayed after acceptance.");
     throw new GatewayError("muse_result", "No result.", 502);
   } });
   await f.ready();
   expect((await f.ask()).status).toBe(502);
+  expect(retryFlags).toEqual([false]);
   const reopened = new Store(f.dir);
   try {
     const restarted = new Gateway(reopened, f.gateway.adapters);

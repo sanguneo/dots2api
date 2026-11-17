@@ -6,6 +6,9 @@ import { z } from "zod";
 import { accountIdSchema, jobIdSchema, providerIdSchema } from "./contracts";
 import type { Account, AccountId, Credentials, Job, JobId, JobImage, ProviderId, RunImage } from "./contracts";
 import { IMAGE_EXTENSIONS, IMAGE_MIMES, MAX_IMAGE_BYTES, MAX_IMAGES, pngSize, sniffImage } from "./images";
+import { MuseThreadStore } from "./muse-thread-store";
+import type { MuseThread } from "./muse-thread-store";
+export type { MuseThread } from "./muse-thread-store";
 
 const accountSchema = z.preprocess((raw) => {
   if (typeof raw !== "object" || raw === null || "enabled" in raw || !("chatEnabled" in raw)) return raw;
@@ -45,24 +48,11 @@ const jobSchema = z.object({
 const credentialsSchema = z.record(z.string(), z.string());
 type Row = { readonly body: string };
 
-/** A Muse side chat this gateway opened and still owns: the only threads it will ever reopen or delete. */
-export interface MuseThread {
-  readonly accountId: AccountId;
-  readonly kind: "image" | "chat";
-  readonly key: string;
-  readonly threadId: string;
-  /** Epoch milliseconds of the last request that used this side chat. */
-  readonly lastUsedAt: number;
-}
-type ThreadRow = { account_id: string; kind: "image" | "chat"; key: string; thread_id: string; last_used_at: number };
-const museThread = (row: ThreadRow): MuseThread => ({
-  accountId: accountIdSchema.parse(row.account_id), kind: row.kind, key: row.key, threadId: row.thread_id, lastUsedAt: row.last_used_at,
-});
-
 export class Store {
   readonly db: Database;
   readonly apiKey: string;
   private readonly key: Buffer;
+  private readonly threads: MuseThreadStore;
 
   constructor(readonly dataDir: string) {
     mkdirSync(dataDir, { recursive: true, mode: 0o700 });
@@ -91,6 +81,7 @@ export class Store {
         PRIMARY KEY (account_id, kind, key)
       );
     `);
+    this.threads = new MuseThreadStore(this.db);
     const existing = this.db.query<{ value: string }, []>("SELECT value FROM settings WHERE name='api_key'").get();
     this.apiKey = existing?.value ?? `d2a_${randomBytes(32).toString("base64url")}`;
     if (!existing) this.db.query("INSERT INTO settings VALUES ('api_key', ?)").run(this.apiKey);
@@ -206,22 +197,19 @@ export class Store {
   }
   deleteAccount(id: AccountId): void {
     this.db.query("DELETE FROM accounts WHERE id=?").run(id);
-    this.db.query("DELETE FROM muse_threads WHERE account_id=?").run(id);
+    this.threads.removeAccount(id);
   }
   museThreads(): MuseThread[] {
-    return this.db.query<ThreadRow, []>("SELECT * FROM muse_threads").all().map(museThread);
+    return this.threads.all();
   }
   museThread(accountId: AccountId, kind: MuseThread["kind"], key: string): MuseThread | null {
-    const row = this.db.query<ThreadRow, [string, string, string]>("SELECT * FROM muse_threads WHERE account_id=? AND kind=? AND key=?").get(accountId, kind, key);
-    return row ? museThread(row) : null;
+    return this.threads.current(accountId, kind, key);
   }
   saveMuseThread(thread: MuseThread): void {
-    this.db.query(`INSERT INTO muse_threads VALUES (?, ?, ?, ?, ?)
-      ON CONFLICT(account_id, kind, key) DO UPDATE SET thread_id=excluded.thread_id, last_used_at=excluded.last_used_at`)
-      .run(thread.accountId, thread.kind, thread.key, thread.threadId, thread.lastUsedAt);
+    this.threads.save(thread);
   }
-  deleteMuseThread(accountId: AccountId, kind: MuseThread["kind"], key: string): void {
-    this.db.query("DELETE FROM muse_threads WHERE account_id=? AND kind=? AND key=?").run(accountId, kind, key);
+  deleteMuseThread(thread: MuseThread): void {
+    this.threads.remove(thread);
   }
   jobs(): Job[] {
     return this.db.query<Row, []>("SELECT body FROM jobs ORDER BY rowid DESC LIMIT 200").all()

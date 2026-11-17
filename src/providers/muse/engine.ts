@@ -546,6 +546,7 @@ export function createMuseAdapter(site = "https://muse.ai", chatTimeout = CHAT_T
         await send.waitFor({ state: "visible", timeout: 10_000 });
         if (!await send.isEnabled()) throw new GatewayError("muse_send", "Muse send button is disabled.", 502);
         submitted = true; // A click can be accepted even if Playwright loses its acknowledgement.
+        context.onSubmitted?.();
         await send.click();
         const threadId = /^\/thread\/([^/]+)\/?$/.exec(new URL(page.url()).pathname)?.[1];
         context.onAccepted?.(threadId && threadId !== "new" ? threadId : null);

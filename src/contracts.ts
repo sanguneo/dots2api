@@ -106,8 +106,10 @@ export interface AdapterContext {
   readonly threadId?: string | null;
   /** Muse: delete the side chat this job just finished (a keyless chat request). Adds to the account's keepContext switch. */
   readonly pruneAfter?: boolean;
-  /** False for keyed side chats: accepted work must not be replayed, even before its remote id is known. */
+  /** False for keyed side chats: possibly submitted work must not be replayed, even before acceptance is confirmed. */
   readonly retryAccepted?: boolean;
+  /** Muse marks submission immediately before Send: a click can reach the provider even if acknowledgement fails. */
+  readonly onSubmitted?: () => void;
   readonly onAccepted?: (remoteId: string | null) => void;
   /** Present when the caller can persist credentials an adapter repaired (for example a rebound thread). */
   readonly saveCredentials?: (credentials: Credentials) => void;

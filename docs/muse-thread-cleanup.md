@@ -13,7 +13,9 @@ delete arbitrary provider chats.
 The route uses the existing API protection: local host only, matching Origin
 when supplied, and either the gateway bearer key or a same-origin browser
 request. Keys follow the creation contract: 1 to 64 characters from
-`A-Z a-z 0-9 . _ : -`. Encode the path segment.
+`A-Z a-z 0-9 . _ : -`. DELETE additionally requires the `w-` prefix;
+other keys, including brain `tg*` chats, return HTTP 400 `invalid_thread`
+before cleanup starts. Encode the path segment.
 
 Response:
 
@@ -47,9 +49,14 @@ Concurrent DELETE requests share cleanup. Unrelated keys remain intact.
 After completion the key can be reused for a fresh chat.
 
 Keyed chats are persisted when Muse accepts them, so interrupted or failed
-jobs can be cleaned after restart.
-An accepted keyed job is not automatically replayed after an uncertain failure,
-so cleanup cannot lose an earlier chat to a replacement attempt.
+jobs can be cleaned after restart. Replacing a key's current remote id
+atomically retains the previous id in SQLite cleanup storage. Only the current
+id is reopened; DELETE and idle cleanup include retained ids and forget each
+one only after remote deletion succeeds or confirms it is gone. Failed
+deletions remain available to the next DELETE, including after restart.
+A keyed job is not automatically replayed once the engine marks it submitted
+immediately before Send, including when the click throws before acceptance
+is confirmed. Keyless calls retain their existing retry behavior.
 Cleanup intent itself is not persisted:
 callers must retain unfinished keys and retry DELETE after a restart or
 HTTP timeout. A DELETE can wait for queued work plus remote deletion; timing

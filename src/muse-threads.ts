@@ -30,7 +30,7 @@ export class MuseThreads {
   async sweep(): Promise<number> {
     const due = this.gateway.store.museThreads().filter((thread) => this.due(thread));
     const outcomes = await Promise.all(due.map((thread) => {
-      const id = [thread.accountId, thread.kind, thread.key].join("\0");
+      const id = [thread.accountId, thread.kind, thread.key, thread.threadId].join("\0");
       if (this.sweeping.has(id)) return undefined;
       this.sweeping.add(id);
       return this.gateway.enqueueMaintenance(thread.accountId, () => this.remove(thread, true))
@@ -64,7 +64,8 @@ export class MuseThreads {
 
   private async remove(thread: MuseThread, idle: boolean): Promise<ThreadDeletion | undefined> {
     const { store, adapters } = this.gateway;
-    const current = idle ? store.museThread(thread.accountId, thread.kind, thread.key) : thread;
+    const current = idle ? store.museThreads().find((owned) => owned.accountId === thread.accountId &&
+      owned.kind === thread.kind && owned.key === thread.key && owned.threadId === thread.threadId) : thread;
     // A request that renewed the chat while an idle sweep waited in line wins.
     if (!current || (idle && !this.due(current))) return undefined;
     const account = store.account(thread.accountId);
@@ -82,9 +83,7 @@ export class MuseThreads {
         console.warn(`[muse-threads] delete failed, will retry ${label}`);
         return outcome;
       }
-      if (store.museThread(thread.accountId, thread.kind, thread.key)?.threadId === current.threadId) {
-        store.deleteMuseThread(thread.accountId, thread.kind, thread.key);
-      }
+      store.deleteMuseThread(current);
       console.log(`[muse-threads] ${outcome === "gone" ? "already gone" : "deleted"} ${label}`);
       return outcome;
     } catch (error) { // Remote deletion boundary: retain the mapping for retry without exposing upstream secrets.
