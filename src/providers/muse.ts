@@ -205,12 +205,20 @@ export function createMuseAdapter(site = "https://muse.ai", chatTimeout = 600_00
     async run(credentials, prompt, context) {
       definition.validate(credentials);
       let lastError: unknown;
+      let accepted = false;
       for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
         try {
-          const result = await runOnce(credentials, prompt, context);
+          const result = await runOnce(credentials, prompt, {
+            ...context,
+            onAccepted: (id) => {
+              accepted = true;
+              context.onAccepted?.(id);
+            },
+          });
           return attempt === 1 ? result : { ...result, text: `${result.text}\n\n[dots2api] ${RETRY_NOTE}`.trim() };
         } catch (error) {
           lastError = error;
+          if (accepted && context.retryAccepted === false) break;
           if (!(error instanceof GatewayError) || context.signal.aborted || FATAL_CODES.has(error.code) || attempt === MAX_ATTEMPTS) break;
           try {
             await reconnect(credentials, context);

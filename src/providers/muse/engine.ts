@@ -486,6 +486,12 @@ export function createMuseAdapter(site = "https://muse.ai", chatTimeout = CHAT_T
       let page: Page | undefined;
       try {
         page = browser.pages()[0] ?? await browser.newPage();
+        // Muse can assign the side-chat URL after Send returns. Report it before a timeout or restart loses the key.
+        page.on("framenavigated", (frame) => {
+          if (!submitted || frame.parentFrame()) return;
+          const threadId = /^\/thread\/([^/]+)\/?$/.exec(new URL(frame.url()).pathname)?.[1];
+          if (threadId && threadId !== "new") context.onAccepted?.(threadId);
+        });
         // A topic key reopens its side chat. If that chat is gone (deleted by hand, or Muse redirects away), start a new one.
         let reused = false;
         if (context.threadId && THREAD_ID.test(context.threadId)) {
