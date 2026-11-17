@@ -241,6 +241,17 @@ export class Store {
     const row = this.db.query<Row, [string]>("SELECT body FROM jobs WHERE id=?").get(id);
     return row ? jobSchema.parse(JSON.parse(row.body)) : null;
   }
+  /** Deletes finished jobs (and their images) that ended before `cutoff` (ISO time); queued and running jobs stay. */
+  pruneJobs(cutoff: string): number {
+    const old = this.db.query<{ id: string }, [string]>(`
+      SELECT id FROM jobs WHERE json_extract(body, '$.status') NOT IN ('queued', 'running')
+        AND COALESCE(json_extract(body, '$.finishedAt'), json_extract(body, '$.createdAt')) < ?
+    `).all(cutoff);
+    const remove = this.db.query("DELETE FROM jobs WHERE id=?");
+    this.db.transaction(() => { for (const job of old) remove.run(job.id); })();
+    for (const job of old) rmSync(join(this.dataDir, "images", job.id), { recursive: true, force: true });
+    return old.length;
+  }
   saveJob(job: Job): Job {
     this.db.query("INSERT INTO jobs VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET body=excluded.body")
       .run(job.id, job.accountId, JSON.stringify(job));
