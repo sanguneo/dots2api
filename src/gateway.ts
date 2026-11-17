@@ -11,6 +11,9 @@ const QUEUE_LIMIT = 20;
 /** Muse image side chats are deleted after this much idle time; chat side chats opened with a topic key after the second. */
 export const IMAGE_IDLE_MS = 600_000;
 export const CHAT_IDLE_MS = 7 * 24 * 3_600_000;
+/** Finished job records (and their images) are deleted once they are older than this; checked at start and hourly. */
+export const JOB_RETENTION_MS = 3 * 24 * 3_600_000;
+const JOB_PRUNE_INTERVAL_MS = 3_600_000;
 export interface GatewayOptions {
   /** A clock the idle rules read, so tests can move time without sleeping. */
   readonly now?: () => number;
@@ -35,6 +38,7 @@ export class Gateway {
   private readonly now: () => number;
   readonly museThreads: MuseThreads;
   private sweepTimer: ReturnType<typeof setInterval> | undefined;
+  private pruneTimer: ReturnType<typeof setInterval> | undefined;
   constructor(
     readonly store: Store,
     readonly adapters: Readonly<Record<ProviderId, ProviderAdapter>>,
@@ -81,6 +85,7 @@ export class Gateway {
   }
   stop(): void {
     clearInterval(this.sweepTimer);
+    clearInterval(this.pruneTimer);
     this.shutdown.abort();
     for (const id of [...this.leaseWaiters.keys()]) this.wakeLeaseWaiters(id);
   }
@@ -236,11 +241,24 @@ export class Gateway {
    * gateway's own map are ever touched, and a chat that cannot be deleted stays in the map for the next sweep.
    */
   sweepThreads(): Promise<number> { return this.museThreads.sweep(); }
-  /** Runs the idle sweep on a timer until stop(). */
+  /** Deletes finished job records older than JOB_RETENTION_MS and returns how many were deleted. */
+  pruneJobs(): number {
+    const deleted = this.store.pruneJobs(new Date(this.now() - JOB_RETENTION_MS).toISOString());
+    if (deleted > 0) this.changed();
+    return deleted;
+  }
+  /** Runs the idle sweep on a timer until stop(), and prunes old job records at start and hourly. */
   startSweeper(intervalMs = 30_000): void {
     clearInterval(this.sweepTimer);
+    clearInterval(this.pruneTimer);
     this.sweepTimer = setInterval(() => { void this.sweepThreads().catch(() => undefined); }, intervalMs);
     this.sweepTimer.unref();
+    const prune = () => {
+      try { this.pruneJobs(); } catch (error) { console.warn(`[jobs] prune failed: ${error instanceof Error ? error.message : String(error)}`); }
+    };
+    prune();
+    this.pruneTimer = setInterval(prune, JOB_PRUNE_INTERVAL_MS);
+    this.pruneTimer.unref();
   }
   /**
    * Startup self-heal: an account left in error (for example by a restart that interrupted its job) is re-checked the way
