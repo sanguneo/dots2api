@@ -31,6 +31,7 @@ try {
     accountId: input.accountId, dataDir: input.dataDir, signal: controller.signal, threadId: input.threadId,
     referenceImages: input.referenceImages.map((image) => ({ mime: image.mime, data: new Uint8Array(Buffer.from(image.dataB64, "base64")) })),
     onAccepted: (remoteId: string | null) => emit({ type: "accepted", remoteId }),
+    onSubmitted: () => emit({ type: "submitted" }),
     saveCredentials: (credentials: Record<string, string>) => emit({ type: "credentials", credentials }),
   };
   switch (input.operation) {

@@ -486,6 +486,12 @@ export function createMuseAdapter(site = "https://muse.ai", chatTimeout = CHAT_T
       let page: Page | undefined;
       try {
         page = browser.pages()[0] ?? await browser.newPage();
+        // Muse can assign the side-chat URL after Send returns. Report it before a timeout or restart loses the key.
+        page.on("framenavigated", (frame) => {
+          if (!submitted || frame.parentFrame()) return;
+          const threadId = /^\/thread\/([^/]+)\/?$/.exec(new URL(frame.url()).pathname)?.[1];
+          if (threadId && threadId !== "new") context.onAccepted?.(threadId);
+        });
         // A topic key reopens its side chat. If that chat is gone (deleted by hand, or Muse redirects away), start a new one.
         let reused = false;
         if (context.threadId && THREAD_ID.test(context.threadId)) {
@@ -540,6 +546,7 @@ export function createMuseAdapter(site = "https://muse.ai", chatTimeout = CHAT_T
         await send.waitFor({ state: "visible", timeout: 10_000 });
         if (!await send.isEnabled()) throw new GatewayError("muse_send", "Muse send button is disabled.", 502);
         submitted = true; // A click can be accepted even if Playwright loses its acknowledgement.
+        context.onSubmitted?.();
         await send.click();
         const threadId = /^\/thread\/([^/]+)\/?$/.exec(new URL(page.url()).pathname)?.[1];
         context.onAccepted?.(threadId && threadId !== "new" ? threadId : null);

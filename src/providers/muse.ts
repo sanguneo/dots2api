@@ -38,6 +38,7 @@ const imageSchema = z.object({
   revisedPrompt: z.string().optional(),
 });
 const eventSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("submitted") }),
   z.object({ type: z.literal("accepted"), remoteId: z.string().nullable() }),
   z.object({ type: z.literal("credentials"), credentials: z.record(z.string(), z.string()) }),
   z.object({ type: z.literal("checked"), detail: z.string() }),
@@ -45,7 +46,7 @@ const eventSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("completed"), text: z.string(), remoteId: z.string().nullable(), images: z.array(imageSchema).default([]) }),
   z.object({ type: z.literal("failed"), code: z.string(), message: z.string(), status: z.number(), uncertain: z.boolean() }),
 ]);
-type Terminal = Exclude<z.infer<typeof eventSchema>, { type: "accepted" } | { type: "credentials" }>;
+type Terminal = Exclude<z.infer<typeof eventSchema>, { type: "submitted" } | { type: "accepted" } | { type: "credentials" }>;
 
 // Compile our TypeScript worker once; the browser's officially supported Node
 // runtime owns all Playwright subprocesses. Credentials travel over stdin only.
@@ -127,6 +128,7 @@ async function callWorker(
       for (const line of lines.filter(Boolean)) {
         const event = eventSchema.parse(JSON.parse(line));
         switch (event.type) {
+          case "submitted": context.onSubmitted?.(); break;
           case "accepted": context.onAccepted?.(event.remoteId); break;
           case "credentials": context.saveCredentials?.(event.credentials); break;
           case "checked":
@@ -205,12 +207,20 @@ export function createMuseAdapter(site = "https://muse.ai", chatTimeout = 600_00
     async run(credentials, prompt, context) {
       definition.validate(credentials);
       let lastError: unknown;
+      let submitted = false;
       for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
         try {
-          const result = await runOnce(credentials, prompt, context);
+          const result = await runOnce(credentials, prompt, {
+            ...context,
+            onSubmitted: () => {
+              submitted = true;
+              context.onSubmitted?.();
+            },
+          });
           return attempt === 1 ? result : { ...result, text: `${result.text}\n\n[dots2api] ${RETRY_NOTE}`.trim() };
         } catch (error) {
           lastError = error;
+          if (submitted && context.retryAccepted === false) break;
           if (!(error instanceof GatewayError) || context.signal.aborted || FATAL_CODES.has(error.code) || attempt === MAX_ATTEMPTS) break;
           try {
             await reconnect(credentials, context);
