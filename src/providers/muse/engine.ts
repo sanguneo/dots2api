@@ -304,11 +304,16 @@ async function mediaBytesInPage(src: string): Promise<{ readonly ok: boolean; re
  */
 const PRUNE_STEP_TIMEOUT = 5_000;
 
-/** Deletes the side chat open on this page; false when it is not exactly one marked row or any step fails. */
+/** Opens the side-chat panel when collapsed, then deletes only its single marked current row. */
 async function pruneCurrentThread(page: Page): Promise<boolean> {
   const current = page.locator('[data-testid="hatch-thread-row"][aria-current="page"]');
-  if (await current.count() !== 1) return false;
   try {
+    // A closed panel unmounts every row, including the open thread's row.
+    if (await current.count() === 0) {
+      await page.getByTestId("hatch-chat-switcher-trigger").click({ timeout: PRUNE_STEP_TIMEOUT });
+      await current.first().waitFor({ state: "visible", timeout: 10_000 });
+    }
+    if (await current.count() !== 1) return false;
     await current.hover({ timeout: PRUNE_STEP_TIMEOUT });
     await current.locator('button[aria-label="More thread actions"]').click({ timeout: PRUNE_STEP_TIMEOUT });
     await page.getByRole("menuitem", { name: "Delete", exact: true }).click({ timeout: PRUNE_STEP_TIMEOUT });
@@ -464,7 +469,6 @@ export function createMuseAdapter(site = "https://muse.ai", chatTimeout = CHAT_T
         const where = new URL(page.url()).pathname.replace(/\/$/, "");
         if (where === "/thread/new" || where === "") return "gone";
         if (where !== path) return "failed";
-        await page.locator('[data-testid="hatch-thread-row"][aria-current="page"]').first().waitFor({ state: "visible", timeout: 10_000 });
         return await pruneCurrentThread(page) ? "deleted" : "failed";
       } catch {
         return "failed";
