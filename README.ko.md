@@ -26,6 +26,7 @@
 
 [yelixir-dev/dots2api](https://github.com/yelixir-dev/dots2api)를 포크해
 대화, 이미지 생성·편집, 선택형 [텔레그램 연결](docs/telegram.md)을 함께 제공합니다.
+[텔레그램 비서 전체 가이드](docs/telegram-assistant-guide.ko.md)에서 설치부터 운영·복구까지 확인할 수 있습니다.
 각자 본인의 Dots·Muse 계정을 연결해서 씁니다.
 
 ```bash
