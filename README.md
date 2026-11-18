@@ -26,7 +26,8 @@
 
 This fork of [yelixir-dev/dots2api](https://github.com/yelixir-dev/dots2api)
 packages conversation, image generation/editing and an optional
-[Telegram relay](docs/telegram.md). Every user connects their own accounts.
+[Telegram relay](docs/telegram.md) ([full assistant guide](docs/telegram-assistant-guide.md),
+[한국어 가이드](docs/telegram-assistant-guide.ko.md)). Every user connects their own accounts.
 
 ```bash
 git clone https://github.com/sanguneo/dots2api.git
