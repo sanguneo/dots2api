@@ -261,6 +261,10 @@ context and configurable aliases first. Workers also need a design against the
 gateway's thread deletion API and failure contracts. Copying private paths,
 fixed IDs or personal prompts is outside this installation flow.
 
+Design references: [Appendix A: strict decision](#appendix-a),
+[Appendix B: worker delegation](#appendix-b), [Appendix C: watchdog](#appendix-c),
+[Appendix D: smaller extensions](#appendix-d).
+
 ## Implementation and official references
 
 - [Config schema](../src/telegram/config.ts), [polling, sending and state](../src/telegram/relay.ts),
@@ -271,3 +275,142 @@ fixed IDs or personal prompts is outside this installation flow.
 
 This repository builds on [yelixir-dev/dots2api](https://github.com/yelixir-dev/dots2api).
 Use `sanguneo/dots2api` for the clone/install instructions in this guide.
+
+<a id="appendix-a"></a>
+
+## Appendix A. Strict response decision
+
+**Not yet implemented in the public repository; design reference for your own
+implementation.** This generalizes structures found in separate operational
+code. Their current enabled state was not verified. Examples are not the
+operational decision wording or configuration.
+
+An external CLI decides whether a group message needs an answer before the main
+assistant receives it. Apply user/chat allowlists first and exclude conversations
+directed at other bots. Explicit calls and replies follow the existing trigger
+path; only messages without a call go through this decision with bounded recent
+context.
+
+```text
+Group message → authorization → exclude other-bot conversations → explicit call?
+  Explicit call → main assistant
+  No explicit call → external CLI decision → strict first-line validation
+    Yes → main assistant
+    No / invalid format / failure / timeout → silence
+```
+
+A generalized protocol could accept only an entire first line of `DECISION: YES`
+or `DECISION: NO`. Extra explanation on that line, empty output or an unknown
+value means silence. A later explanation cannot override an invalid first line;
+do not route an ambiguous decision to the main assistant as a fallback.
+
+Bound context lines, context length and CLI execution time, and pass input as
+data rather than command arguments. Decide which group messages and context may
+reach the additional model first. Each decision adds cost and latency, so
+consider this an opt-in feature, disabled by default, and count decisions/errors
+without storing content. A variant can add a short context memo to explicit
+calls, but requires another invocation; that memo cannot replace authorization
+or the user's original input.
+
+<a id="appendix-b"></a>
+
+## Appendix B. Worker delegation
+
+**Not yet implemented in the public repository; design reference for your own
+implementation.** This generalizes a delegation structure in separate
+operational code without asserting that it is currently enabled. The block below
+is a newly chosen illustrative protocol.
+
+The main assistant emits a structured task block for long work. The relay removes
+that block from the user-facing answer and passes it to a worker in a separate
+conversation thread.
+
+```text
+<task>
+Goal: Compare the supplied material.
+Scope: Read only.
+Completion: Return differences and evidence.
+</task>
+```
+
+- Execute only closed task blocks. Hide truncated blocks and report them as
+  incomplete. Allow only one active worker globally; report busy status to the
+  main assistant instead of starting another. Even if worker requests run outside
+  the receive queue, first check compatibility with the account's serial queue.
+- Separate worker and main threads and bound execution time and result summary
+  length. For example, accept completion only when the last nonempty line is
+  `RESULT: DONE` or `RESULT: BLOCKED <reason>`. Classify missing terminal signals,
+  empty output, timeouts and execution errors separately.
+- Return the result and terminal status to the main conversation. The main
+  assistant checks the goal, evidence and completion criteria before replying to
+  the original message. A terminal signal alone does not prove success. Disable
+  further delegation during result reporting and review.
+- If another question arrives during worker execution, explain that long work is
+  in progress. Failed notices or uncertain deliveries must not rerun the work.
+- Atomically persist versioned private task state and thread cleanup status.
+  Refuse startup if its schema is corrupt. On restart, mark previously running
+  work interrupted instead of executing it again.
+- Persist an interrupted-result reporting attempt before sending it to prevent
+  duplicate reports after restart. This can lose a report, so retain inspectable
+  status as well. Keep undeleted threads pending cleanup for separate maintenance.
+
+Verify the gateway's thread identity header and deletion API, including
+availability, authorization and failure semantics. Design against the public
+relay's stop-on-error contract and `pending` protection. Adding this block to a
+prompt alone does not implement delegation.
+
+<a id="appendix-c"></a>
+
+## Appendix C. Watchdog
+
+**Not yet implemented in the public repository; design reference for your own
+implementation.** This describes a separate health watcher, distinct from the
+existing systemd failure restart. The operational watcher's current execution
+and schedule were not verified.
+
+Watch service activity, elapsed time for received requests without completion,
+and error counts within a time window. Choose stall thresholds against request
+timeouts and legitimate long work. Record intentional silence as processing
+completion so it is not mistaken for a stall.
+
+```text
+Single-watcher lock → service / unfinished-request age / error rate checks
+  Healthy → exit
+  Unhealthy → inspect pending and active work → check restart cooldown
+    Recoverable → bounded restart → check health again
+    Uncertain work / persistent failure → diagnosis and manual inspection
+```
+
+Persist the last restart time to limit repeated restarts and retain the service
+manager's start limit. Do not interrupt live work based on elapsed time alone;
+check its remote outcome. Never automatically delete `pending`, offsets or
+locks, or resubmit uncertain requests.
+
+Begin diagnosis with service status and content-free timing/error counters.
+If adding external CLI diagnosis, give it a separate cooldown and timeout and
+send only material stripped of secrets and message bodies. Do not turn its
+conclusions into automatic command execution. Passing raw logs to a model is
+outside this design example.
+
+<a id="appendix-d"></a>
+
+## Appendix D. Smaller extension candidates
+
+**Not yet implemented in the public repository; design reference for your own
+implementation.** These candidates require separate implementation and
+verification; they are not available settings or claims about current
+operational activation.
+
+| Candidate | Implementation considerations |
+| --- | --- |
+| Reply to the original message | Pass the original message reference to text, image and file sends. Split replies should reference the same original; never automatically retry uncertain deliveries. |
+| Captions and quoted context | Use captions when text is absent; distinguish sender labels, bounded quotes and attachment types as data. This does not interpret actual photo or document contents. |
+| Trigger aliases | Define aliases in configuration and exclude calls directed at other bots. Preserve user/chat allowlists and bot-sender restrictions. |
+| Silence signal | Define an explicit contract such as sending nothing when the sole output is `SILENT`. Define removal rules when mixed with other content, and distinguish this from an ordinary empty-output error. |
+| Progress indicators | Send typing at a bounded interval while work runs; clear indicators on completion, failure or silence. Indicator failures must not rerun work or duplicate answers. |
+| Source-label cleanup | Remove only an orphan trailing source heading, preserving actual source links and text. |
+| System-prompt interval | Consider only for a backend that retains threads. Persist the last-send time, reset it when recreating a thread, and check that restarts cannot omit instructions. |
+
+Even small extensions should default to off and preserve public URL
+origin/path/MIME checks, filename and file-encoding validation, and `pending`
+protection.
