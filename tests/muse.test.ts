@@ -80,6 +80,10 @@ const html = `<!doctype html><html><body>
       const agent = document.querySelector(".hatch-agent-bubble-bg");
       if (input.value.startsWith("draw")) {
         agent.innerHTML = '<div data-testid="hatch-chat-attachment-presentation-1"><img src="/media/result.png"></div>';
+      } else if (input.value.startsWith("late")) {
+        // The text lands and Stop goes away before the picture mounts in the bubble.
+        agent.textContent = "Here it is.";
+        setTimeout(() => agent.insertAdjacentHTML("beforeend", '<img src="/media/result.png">'), 1000);
       } else if (input.value.startsWith("say")) {
         agent.innerHTML = "<p>First line.</p><p>Second line.</p>";
       } else if (input.value.startsWith("source")) {
@@ -209,6 +213,18 @@ describe("Muse browser adapter", () => {
     expect(result.images?.[0]?.mime).toBe("image/png");
     expect(result.images?.[0]?.width).toBe(1);
     expect(result.images?.[0]?.height).toBe(1);
+    expect(Buffer.from(result.images?.[0]?.data ?? []).equals(Buffer.from(png))).toBe(true);
+  }, 60_000);
+
+  it("still returns an image that mounts shortly after the reply completes", async () => {
+    // Given a signed-in account whose answer text completes about a second before its picture appears.
+    const context = { accountId: accountA, dataDir, signal: new AbortController().signal };
+    await adapter.check({ cookieHeader: "hatch_sess=valid" }, context);
+    // When the turn finishes with no attachment card yet.
+    const result = await adapter.run({}, "late picture", context);
+    // Then the late picture is still collected with the text.
+    expect(result.text).toBe("Here it is.");
+    expect(result.images).toHaveLength(1);
     expect(Buffer.from(result.images?.[0]?.data ?? []).equals(Buffer.from(png))).toBe(true);
   }, 60_000);
 

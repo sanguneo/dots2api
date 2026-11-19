@@ -21,6 +21,11 @@ const CHAT_TIMEOUT = 600_000;
 /** A thread id goes into a URL path, so only the characters Muse itself uses are allowed. */
 const THREAD_ID = /^[A-Za-z0-9_-]{1,128}$/;
 const ATTACHMENT_TIMEOUT = 10_000;
+/**
+ * After completion with no new attachment card, a late image gets this grace instead of the full attachment wait. Every
+ * text-only chat reply used to pay the whole ATTACHMENT_TIMEOUT here, about half of a short muse-agent answer.
+ */
+const LATE_IMAGE_GRACE = 2_000;
 /** References can total 32 MiB, so their upload gets its own, much longer, budget than a thumbnail read. */
 const REFERENCE_UPLOAD_TIMEOUT = 120_000;
 const MEDIA_LOAD_TIMEOUT = 10_000;
@@ -361,12 +366,14 @@ export function createMuseAdapter(site = "https://muse.ai", chatTimeout = CHAT_T
     context.saveCredentials?.({ ...credentials, cookieHeader: renewed.map((cookie) => `${cookie.name}=${cookie.value}`).join("; ") });
   }
 
-  async function generatedImages(page: Page, baseline: ReadonlySet<string>): Promise<RunImage[]> {
+  async function generatedImages(page: Page, baseline: ReadonlySet<string>, baselineAttachments: number): Promise<RunImage[]> {
     const collect = async (): Promise<Attachment[]> =>
       (await page.evaluate(attachmentsInPage)).filter((attachment) =>
         attachment.src && !attachment.hasVideo && !baseline.has(attachment.src) && !attachment.src.startsWith("data:image/svg"));
     let fresh = await collect();
     if (fresh.length === 0) {
+      // A new attachment card means media is still mounting, so it keeps the full wait; otherwise only a short grace.
+      const pending = await page.locator('[data-testid^="hatch-chat-attachment-presentation-"]').count() > baselineAttachments;
       try {
         await page.waitForFunction((known: string[]) => {
           const seen = new Set(known);
@@ -375,7 +382,7 @@ export function createMuseAdapter(site = "https://muse.ai", chatTimeout = CHAT_T
               const src = (node as HTMLImageElement).currentSrc || (node as HTMLImageElement).src || "";
               return src && !seen.has(src) && !src.includes("avatar") && !src.includes("emoji");
             });
-        }, [...baseline], { timeout: ATTACHMENT_TIMEOUT });
+        }, [...baseline], { timeout: pending ? ATTACHMENT_TIMEOUT : LATE_IMAGE_GRACE });
       } catch {
         // A text-only answer produces no attachment.
       }
@@ -554,7 +561,7 @@ export function createMuseAdapter(site = "https://muse.ai", chatTimeout = CHAT_T
           if (!location.pathname.startsWith("/thread/")) throw new Error("Muse left the chat thread.");
           return document.documentElement.dataset["museComplete"] === "true";
         }, null, { timeout: chatTimeout });
-        const images = await generatedImages(page, baseline);
+        const images = await generatedImages(page, baseline, baselineAttachments);
         // An image-only answer has no agent text bubble, and waiting for one timed out after the image had arrived.
         const bubbles = page.locator('div[class*="hatch-agent-bubble-bg"]');
         const rawText = await bubbles.count() ? await bubbles.last().innerText({ timeout: 5_000 }) : "";
