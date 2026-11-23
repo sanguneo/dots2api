@@ -39,7 +39,7 @@ const jobSchema = z.object({
   error: z.string().nullable(),
   errorCode: z.string().optional(),
   approval: jobApprovalSchema.optional(),
-  followup: z.object({ originJobId: jobIdSchema.nullable(), deliveredAt: z.string().nullable(), deliveryId: z.string().optional() }).optional(),
+  followup: z.object({ originJobId: jobIdSchema.nullable(), deliveredAt: z.string().nullable(), deliveryId: z.string().optional(), contentHash: z.string().optional() }).optional(),
   pendingTask: z.boolean().optional(),
   remoteId: z.string().nullable(),
   images: z.array(z.object({

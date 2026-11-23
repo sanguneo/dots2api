@@ -60,6 +60,7 @@ async function emitResult(result: RunResult, event: { readonly type: "completed"
     remoteId: result.remoteId,
     pendingTask: result.pendingTask,
     deliveryId: result.deliveryId,
+    followupKeys: result.followupKeys,
     images: (result.images ?? []).map((image) => ({
       mime: image.mime,
       dataB64: Buffer.from(image.data).toString("base64"),

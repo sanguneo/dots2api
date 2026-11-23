@@ -72,6 +72,8 @@ test("a side-task image is delivered once and never attached to the next text re
       if (path === "/api/session") return Response.json({ status: "assigned" });
       if (path === "/side.png") return new Response(oldImage, { headers: { "content-type": "image/png" } });
       if (path === "/submit") { turn++; return Response.json({ turn }); }
+      // Finish after the watcher's first baseline, when its route loop reaches home.
+      if (path === "/" && turn === 1) sideDone = true;
       // The old image is deliberately absent when the next foreground page hydrates.
       const content = path === "/thread/origin" ? (turn ? historical : "") + (sideDone ? sideText : "") : "";
       return new Response(`<!doctype html><html><body><textarea></textarea><button aria-label="Send">Send</button>
@@ -99,7 +101,6 @@ test("a side-task image is delivered once and never attached to the next text re
   try {
     const context = { accountId, dataDir, threadId: "origin", signal: AbortSignal.timeout(25_000) };
     expect((await adapter.run({}, "Start side work", context)).pendingTask).toBe(true);
-    sideDone = true;
     if (!adapter.watch) throw new Error("Missing Muse watcher");
     watching = adapter.watch({}, {
       accountId, dataDir, signal: AbortSignal.any([abort.signal, AbortSignal.timeout(15_000)]),

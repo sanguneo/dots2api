@@ -118,10 +118,12 @@ test.each([
   }
 }, 35_000);
 
-test("an intervening foreground turn does not consume a prior side task result", async () => {
+test("a result already present before watcher startup belongs to its baseline", async () => {
   const dataDir = await mkdtemp(join(tmpdir(), "muse-unconsumed-result-"));
   const abort = new AbortController();
-  const received = Promise.withResolvers<RunResult>();
+  const observed = Promise.withResolvers<void>();
+  const results: RunResult[] = [];
+  let originVisits = 0;
   let finished = false;
   const row = (id: string, text: string) => `<div data-message-id="${id}">${reply(text)}</div>`;
   const history = row("kickoff", "Starting old task.");
@@ -132,6 +134,7 @@ test("an intervening foreground turn does not consume a prior side task result",
     hostname: "127.0.0.1", port: 0,
     fetch(request) {
       const path = new URL(request.url).pathname;
+      if (path === "/thread/origin" && ++originVisits >= 4) observed.resolve();
       if (path === "/api/session") return Response.json({ status: "assigned" });
       if (path === "/finished") { finished = true; return new Response(null, { status: 204 }); }
       return new Response(chat(path === "/thread/origin" ? history + (finished ? user + late + current : "") : "", `
@@ -158,10 +161,10 @@ test("an intervening foreground turn does not consume a prior side task result",
       accountId, dataDir, signal: AbortSignal.any([abort.signal, AbortSignal.timeout(15_000)]),
       threads: [{ threadId: "origin", jobId, output: "Current plain reply." }],
       onWatchApproval: () => () => {},
-      onWatchResult: (_id, result) => received.resolve(result),
+      onWatchResult: (_id, result) => { results.push(result); },
     });
-    const result = await Promise.race([received.promise, watching.then(() => { throw new Error("Missing unconsumed side task result"); })]);
-    expect(result.text).toBe("Old task finished.");
+    await Promise.race([observed.promise, watching.then(() => { throw new Error("Watcher did not revisit the baseline"); })]);
+    expect(results).toEqual([]);
   } finally {
     abort.abort();
     await watching?.catch(() => undefined);
