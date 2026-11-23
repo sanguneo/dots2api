@@ -4,8 +4,9 @@ import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, re
 import { join } from "node:path";
 import { z } from "zod";
 import { accountIdSchema, jobIdSchema, providerIdSchema } from "./contracts";
-import type { Account, AccountId, Credentials, Job, JobId, JobImage, ProviderId, RunImage } from "./contracts";
+import type { Account, AccountId, Credentials, Job, JobFile, JobId, JobImage, ProviderId, RunFile, RunImage } from "./contracts";
 import { IMAGE_EXTENSIONS, IMAGE_MIMES, MAX_IMAGE_BYTES, MAX_IMAGES, pngSize, sniffImage } from "./images";
+import { JobFiles, jobFilesSchema } from "./job-files";
 import { MuseThreadStore } from "./muse-thread-store";
 import type { MuseThread } from "./muse-thread-store";
 export type { MuseThread } from "./muse-thread-store";
@@ -42,6 +43,7 @@ const jobSchema = z.object({
     width: z.number().int().positive().optional(), height: z.number().int().positive().optional(),
     revisedPrompt: z.string().optional(),
   })).default([]),
+  files: jobFilesSchema,
   createdAt: z.string(),
   finishedAt: z.string().nullable(),
 });
@@ -53,8 +55,10 @@ export class Store {
   readonly apiKey: string;
   private readonly key: Buffer;
   private readonly threads: MuseThreadStore;
+  private readonly files: JobFiles;
 
   constructor(readonly dataDir: string) {
+    this.files = new JobFiles(dataDir);
     mkdirSync(dataDir, { recursive: true, mode: 0o700 });
     chmodSync(dataDir, 0o700);
     const keyPath = join(dataDir, "master.key");
@@ -92,7 +96,7 @@ export class Store {
   /** Grok Bot support was removed; its accounts, jobs and images are deleted once. Dots and Muse data are kept. */
   private dropRetiredProviders(): void {
     const retired = this.db.query<{ id: string }, []>("SELECT id FROM jobs WHERE json_extract(body, '$.provider') NOT IN ('dots', 'muse')").all();
-    for (const job of retired) rmSync(join(this.dataDir, "images", job.id), { recursive: true, force: true });
+    for (const job of retired) this.removeJobMedia(job.id);
     this.db.exec(`
       DELETE FROM jobs WHERE json_extract(body, '$.provider') NOT IN ('dots', 'muse');
       DELETE FROM accounts WHERE json_extract(body, '$.provider') NOT IN ('dots', 'muse');
@@ -241,7 +245,11 @@ export class Store {
     const row = this.db.query<Row, [string]>("SELECT body FROM jobs WHERE id=?").get(id);
     return row ? jobSchema.parse(JSON.parse(row.body)) : null;
   }
-  /** Deletes finished jobs (and their images) that ended before `cutoff` (ISO time); queued and running jobs stay. */
+  private removeJobMedia(id: string): void {
+    rmSync(join(this.dataDir, "images", id), { recursive: true, force: true });
+    this.files.remove(id);
+  }
+  /** Deletes finished jobs and their media before `cutoff` (ISO time); queued and running jobs stay. */
   pruneJobs(cutoff: string): number {
     const old = this.db.query<{ id: string }, [string]>(`
       SELECT id FROM jobs WHERE json_extract(body, '$.status') NOT IN ('queued', 'running')
@@ -249,13 +257,22 @@ export class Store {
     `).all(cutoff);
     const remove = this.db.query("DELETE FROM jobs WHERE id=?");
     this.db.transaction(() => { for (const job of old) remove.run(job.id); })();
-    for (const job of old) rmSync(join(this.dataDir, "images", job.id), { recursive: true, force: true });
+    for (const job of old) this.removeJobMedia(job.id);
     return old.length;
   }
   saveJob(job: Job): Job {
     this.db.query("INSERT INTO jobs VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET body=excluded.body")
       .run(job.id, job.accountId, JSON.stringify(job));
     return job;
+  }
+  saveFiles(jobId: JobId, files: readonly RunFile[]): JobFile[] {
+    return this.files.save(jobId, files);
+  }
+  file(jobId: JobId, index: number): { readonly metadata: JobFile; readonly data: Blob } | null {
+    const metadata = this.job(jobId)?.files?.[index];
+    if (!metadata) return null;
+    const data = this.files.open(jobId, index);
+    return data ? { metadata, data } : null;
   }
   /** Images live beside the database (`data/images/<job id>/<index>.<ext>`), never inside it. */
   private imagePath(jobId: JobId, index: number, extension?: string): string {

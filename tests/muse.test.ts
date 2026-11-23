@@ -80,6 +80,8 @@ const html = `<!doctype html><html><body>
       const agent = document.querySelector(".hatch-agent-bubble-bg");
       if (input.value.startsWith("draw")) {
         agent.innerHTML = '<div data-testid="hatch-chat-attachment-presentation-1"><img src="/media/result.png"></div>';
+      } else if (input.value.startsWith("video")) {
+        agent.innerHTML = '<div data-testid="hatch-chat-attachment-presentation-video"><video src="/media/result.mp4" poster="/media/result.png"></video></div>';
       } else if (input.value.startsWith("late")) {
         // The text lands and Stop goes away before the picture mounts in the bubble.
         agent.textContent = "Here it is.";
@@ -101,7 +103,8 @@ const html = `<!doctype html><html><body>
             document.body.insertAdjacentHTML("beforeend", '<div role="menu"><div role="menuitem">Copy</div><div role="menuitem" id="dl">Download</div><div role="menuitem">Download as PDF</div></div>');
             document.getElementById("dl").addEventListener("click", () => {
               const link = document.createElement("a");
-              link.href = "/file/memo.md"; link.download = "memo.md"; document.body.append(link); link.click();
+              link.href = input.value.includes("binary") ? "/file/archive.bin" : "/file/memo.md";
+              link.download = input.value.includes("binary") ? "archive.bin" : "memo.md"; document.body.append(link); link.click();
             });
           });
         });
@@ -133,9 +136,13 @@ describe("Muse browser adapter", () => {
           return Response.json({ status: request.headers.get("cookie")?.includes("hatch_sess=valid") ? "assigned" : "anonymous" });
         }
         if (path === "/media/result.png") return new Response(png, { headers: { "content-type": "image/png" } });
+        if (path === "/media/result.mp4") return new Response(Uint8Array.from([0, 0, 0, 20, 102, 116, 121, 112, 105, 115, 111, 109]), { headers: { "content-type": "video/mp4" } });
         if (path === "/file/memo.md") {
           return new Response("# Memo\n\uD55C\uAE00", { headers: { "content-type": "application/octet-stream", "content-disposition": 'attachment; filename="memo.md"' } });
         }
+        if (path === "/file/archive.bin") return new Response(new Uint8Array(2 * 1024 * 1024 + 1).fill(255), {
+          headers: { "content-type": "application/octet-stream", "content-disposition": 'attachment; filename="archive.bin"' },
+        });
         // The hosted copy of an uploaded reference; any job that returns these bytes returned the user's own upload.
         if (path === "/media/reference.png") return new Response(referencePng, { headers: { "content-type": "image/png" } });
         if (path === "/upload") {
@@ -228,6 +235,17 @@ describe("Muse browser adapter", () => {
     expect(Buffer.from(result.images?.[0]?.data ?? []).equals(Buffer.from(png))).toBe(true);
   }, 60_000);
 
+  it("returns generated video bytes rather than its poster image", async () => {
+    const context = { accountId: accountA, dataDir, signal: new AbortController().signal };
+    await adapter.check({ cookieHeader: "hatch_sess=valid" }, context);
+    const result = await adapter.run({}, "video result", context);
+    expect(result.images).toBeUndefined();
+    expect(result.files).toEqual([{
+      name: "video-1.mp4", mime: "video/mp4",
+      data: Uint8Array.from([0, 0, 0, 20, 102, 116, 121, 112, 105, 115, 111, 109]),
+    }]);
+  }, 60_000);
+
   it("appends the real address behind a source chip and drops the dangling label", async () => {
     // Given a signed-in account whose answer ends in "출처:" with the chip's link in a separate assistant item.
     const context = { accountId: accountA, dataDir, signal: new AbortController().signal };
@@ -247,6 +265,16 @@ describe("Muse browser adapter", () => {
     // Then no image is reported and the downloaded file travels in the reply.
     expect(result.images).toBeUndefined();
     expect(result.text).toBe('Made it.\n\n[[file name="memo.md" encoding="utf8"]]\n# Memo\n\uD55C\uAE00\n[[/file]]');
+  }, 60_000);
+
+  it("returns an attached binary larger than the old inline block limit", async () => {
+    const context = { accountId: accountA, dataDir, signal: new AbortController().signal };
+    await adapter.check({ cookieHeader: "hatch_sess=valid" }, context);
+    const result = await adapter.run({}, "file binary", context);
+    expect(result.images).toBeUndefined();
+    expect(result.files?.[0]?.name).toBe("archive.bin");
+    expect(result.files?.[0]?.mime).toBe("application/octet-stream");
+    expect(result.files?.[0]?.data).toEqual(new Uint8Array(2 * 1024 * 1024 + 1).fill(255));
   }, 60_000);
 
   it("uploads reference images through the composer before the prompt is sent", async () => {

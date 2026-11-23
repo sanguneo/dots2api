@@ -11,7 +11,7 @@ const QUEUE_LIMIT = 20;
 /** Muse image side chats are deleted after this much idle time; chat side chats opened with a topic key after the second. */
 export const IMAGE_IDLE_MS = 600_000;
 export const CHAT_IDLE_MS = 7 * 24 * 3_600_000;
-/** Finished job records (and their images) are deleted once they are older than this; checked at start and hourly. */
+/** Finished jobs and their media are deleted once older than this; checked at start and hourly. */
 export const JOB_RETENTION_MS = 3 * 24 * 3_600_000;
 const JOB_PRUNE_INTERVAL_MS = 3_600_000;
 export interface GatewayOptions {
@@ -313,7 +313,7 @@ export class Gateway {
     const waiting = this.depth(account.id) > 0;
     const job: Job = {
       id: jobIdSchema.parse(crypto.randomUUID()), accountId: account.id, provider: account.provider,
-      prompt: input.prompt, status: waiting ? "queued" : "running", output: "", error: null, remoteId: null, images: [],
+      prompt: input.prompt, status: waiting ? "queued" : "running", output: "", error: null, remoteId: null, images: [], files: [],
       createdAt: new Date().toISOString(), finishedAt: null,
     };
     this.store.saveAccount({ ...account, lastUsedAt: job.createdAt });
@@ -415,13 +415,24 @@ export class Gateway {
         }
         if (images.length < result.images.length && !note) note = `\n\n[dots2api] ${result.images.length - images.length} image(s) were not stored (unsupported type or too large).`;
       }
+      let files: NonNullable<Job["files"]> = [];
+      if (result.files?.length) {
+        try {
+          files = this.store.saveFiles(job.id, result.files);
+          if (files.length < result.files.length) {
+            note += `\n\n[dots2api] ${result.files.length - files.length} file(s) exceeded the attachment size or count limit.`;
+          }
+        } catch {
+          note += "\n\n[dots2api] The remote agent produced files, but they could not be saved locally.";
+        }
+      }
       // Finished side chats renew their idle window; keyed accepted chats are already persisted above.
       // A keyless chat was already deleted by the worker; a failed deletion there leaves it for the operator.
       if (sideChat && key && result.remoteId && (sideChat.kind === "image" || sideChat.thread)) {
         this.store.saveMuseThread({ accountId: job.accountId, kind: sideChat.kind, key, threadId: result.remoteId, lastUsedAt: this.now() });
       }
       return this.store.saveJob({
-        ...job, status: "completed", output: result.text + note, remoteId: result.remoteId, images, finishedAt: new Date().toISOString(),
+        ...job, status: "completed", output: result.text + note, remoteId: result.remoteId, images, files, finishedAt: new Date().toISOString(),
       });
     } catch (error) {
       const uncertain = !(error instanceof GatewayError) || error.uncertain;
