@@ -113,6 +113,7 @@ try {
       if (!adapter.watch) throw workerProtocolError();
       await adapter.watch(input.credentials, {
         ...context, threads: input.threads,
+        onWatchBaseline: (threadId, hashes) => emit({ type: "watch_baseline", threadId, hashes }),
         onWatchApproval: publishApproval,
         onWatchResult: (threadId, result) => {
           pending = pending.then(() => emitResult(result, { type: "watch_result", threadId }));

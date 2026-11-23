@@ -57,6 +57,7 @@ const eventSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("file"), name: z.string(), mime: z.string(), dataB64: z.string().max(Math.ceil(MAX_FILE_BYTES / 3) * 4) }),
   z.object({ type: z.literal("completed"), ...resultFields }),
   z.object({ type: z.literal("watch_result"), threadId: z.string(), ...resultFields }),
+  z.object({ type: z.literal("watch_baseline"), threadId: z.string(), hashes: z.array(z.string().regex(/^[a-f0-9]{64}$/)).max(512) }),
   z.object({ type: z.literal("watched") }),
   z.object({ type: z.literal("failed"), code: z.string(), message: z.string(), status: z.number(), uncertain: z.boolean() }),
 ]);
@@ -239,6 +240,10 @@ async function callWorker(
             if (!watch) throw workerProtocolError();
             // A verified frame already produced by the browser must survive account preemption.
             watch.onWatchResult(event.threadId, runResult(event, files.splice(0)));
+            break;
+          case "watch_baseline":
+            if (!watch) throw workerProtocolError();
+            watch.onWatchBaseline?.(event.threadId, event.hashes);
             break;
         }
     }

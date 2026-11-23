@@ -1,91 +1,16 @@
-import { createHash, randomUUID } from "node:crypto";
-import { readFile, rename, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import type { Page } from "playwright";
-import { z } from "zod";
 import { GatewayError, MAX_FILES } from "../../contracts";
 import type { MuseWatchContext } from "../../contracts";
 import { APPROVAL_CARD_SELECTOR, scanApprovalCard } from "./approval-dom";
 import { ApprovalWait } from "./approval-wait";
 import { hasPendingMuseTask } from "./completion";
-import { attachmentsInPage, downloadFiles, FILE_CARD, generatedMedia, mediaBytesInPage, mediaSourceIdentity } from "./media";
+import { attachmentsInPage, downloadFiles, generatedMedia } from "./media";
 import { followupContentHash } from "../../muse-followups";
+import { digest, mediaIdentity, readState, readTranscript, saveState } from "./watch-state";
 
 const threadId = /^[A-Za-z0-9_-]{1,128}$/;
-const snapshotSchema = z.object({
-  messages: z.array(z.string()), sources: z.array(z.string()), cards: z.number(), files: z.array(z.string()),
-  users: z.array(z.string()),
-  mediaKeys: z.array(z.string()).default([]), presentations: z.array(z.string()).default([]),
-  messageIds: z.array(z.string()).default([]),
-});
-const approvalSchema = z.object({
-  id: z.uuid(), expiresAt: z.iso.datetime(), clicked: z.boolean(),
-});
-const stateSchema = z.object({
-  approvals: z.record(z.string(), approvalSchema),
-  captures: z.record(z.string(), snapshotSchema),
-  targets: z.array(z.string()).default([]),
-  deliveredHashes: z.array(z.string()).default([]),
-});
-type Snapshot = z.infer<typeof snapshotSchema>;
-const digest = (value: string) => createHash("sha256").update(value).digest("hex");
-
-type WatchState = z.infer<typeof stateSchema>;
-
-async function readState(path: string): Promise<WatchState> {
-  try {
-    return stateSchema.parse(JSON.parse(await readFile(path, "utf8")));
-  } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "ENOENT") return { approvals: {}, captures: {}, targets: [], deliveredHashes: [] };
-    throw error;
-  }
-}
-
-async function saveState(path: string, state: WatchState): Promise<void> {
-  const temporary = `${path}.tmp`;
-  await writeFile(temporary, JSON.stringify(state), { mode: 0o600 });
-  await rename(temporary, path);
-}
-
-const mediaIdentity = (src: string) => digest(mediaSourceIdentity(src));
-
-async function readTranscript(page: Page) {
-  const contents = await page.evaluate(({ fileSelector }) => {
-    const bubbles = [...document.querySelectorAll<HTMLElement>('div[class*="hatch-agent-bubble-bg"]')];
-    return {
-      messages: bubbles.map((bubble) => ({
-        id: bubble.closest("[data-message-id]")?.getAttribute("data-message-id") ?? "",
-        text: bubble.innerText.trim(),
-      })),
-      cards: document.querySelectorAll('[data-testid^="hatch-chat-attachment-presentation-"]').length,
-      presentations: [...document.querySelectorAll('[data-testid^="hatch-chat-attachment-presentation-"]')]
-        .map(element => `${element.closest("[data-message-id]")?.getAttribute("data-message-id") ?? ""}\n${element.getAttribute("data-testid") ?? ""}`),
-      messageIds: [...document.querySelectorAll("[data-message-id]")].map(element => element.getAttribute("data-message-id") ?? ""),
-      files: [...document.querySelectorAll(fileSelector)].flatMap((element) => element.getAttribute("data-testid") ?? []),
-      users: [...document.querySelectorAll<HTMLElement>('[data-message-item="true"][data-message-role="user"],div[class*="chat-user-bubble"]')]
-        .map((element) => `${element.getAttribute("data-message-id") ?? ""}\n${element.innerText.trim()}`),
-      generating: Boolean(document.querySelector('[data-testid="hatch-composer-stop-button"],button[aria-label="Stop"]')),
-    };
-  }, { fileSelector: FILE_CARD });
-  const attachments = (await page.evaluate(attachmentsInPage)).filter(({ src }) => !src.startsWith("data:image/svg"));
-  const sources = attachments.map(({ src }) => src);
-  const mediaKeys = await Promise.all(attachments.map(async item => {
-    if (item.message) return digest(`message\n${item.message}`);
-    if (item.presentation) return digest(`presentation\n\n${item.presentation}`);
-    // Blob object URLs are regenerated on every reload. Anonymous media needs a byte identity.
-    const bytes = await page.evaluate(mediaBytesInPage, item.src);
-    if (bytes.error || !bytes.b64) throw new GatewayError("muse_watch_media", "Cannot baseline anonymous Muse media.", 502);
-    return digest(Buffer.from(bytes.b64, "base64").toString("base64"));
-  }));
-  const snapshot = {
-    messages: contents.messages.map(({ id, text }) => digest(`${id}\n${text}`)),
-    sources: sources.map(mediaIdentity), cards: contents.cards, files: contents.files.map(digest), users: contents.users.map(digest),
-    mediaKeys, presentations: contents.presentations,
-    messageIds: contents.messageIds,
-  };
-  return { ...contents, sources, snapshot };
-}
-
 /** Snapshot the delivered turn before foreground teardown so a fast follow-up is not mistaken for history. */
 export async function rememberMuseTranscript(page: Page, statePath: string, id: string, delivered?: {
   readonly message: { readonly id: string; readonly text: string } | null;
@@ -113,6 +38,8 @@ export async function rememberMuseTranscript(page: Page, statePath: string, id: 
       mediaKeys: [...new Set([...(previous?.mediaKeys ?? []), ...current.mediaKeys])],
       presentations: [...new Set([...(previous?.presentations ?? []), ...current.presentations])],
       messageIds: [...new Set([...(previous?.messageIds ?? []), ...current.messageIds])],
+      mediaHashes: [...new Set([...(previous?.mediaHashes ?? []), ...current.mediaHashes])],
+      texts: [...new Set([...(previous?.texts ?? []), ...current.texts])],
     };
   }
   await saveState(statePath, state);
@@ -128,10 +55,11 @@ export async function watchMusePage(page: Page, origin: URL, context: MuseWatchC
   const preflighted = new Set<string>();
   const candidates = new Map<string, { readonly fingerprint: string; readonly since: number }>();
   const baselined = new Set<string>();
+  const sourceHashes = new Map<string, string>();
   const activePath = () => /^\/thread\/([A-Za-z0-9_-]{1,128})\/?$/.exec(new URL(page.url()).pathname)?.[1] ?? null;
 
   const capture = async (id: string) => {
-    const current = await readTranscript(page);
+    const current = await readTranscript(page, sourceHashes);
     // URLs are transport handles, never evidence of a new presentation.
     const fingerprint = digest(JSON.stringify({ ...current.snapshot, sources: [] }));
     const baseline = state.captures[id];
@@ -148,16 +76,21 @@ export async function watchMusePage(page: Page, origin: URL, context: MuseWatchC
       baselined.add(id);
       candidates.delete(id);
       await save();
+      context.onWatchBaseline?.(id, current.snapshot.mediaHashes);
       return;
     }
     const original = threads.get(id)?.output.trim();
     const text = current.messages.filter(({ id: messageId, text }, index) => text &&
-      (!messageId || !baseline.messageIds.includes(messageId)) && !baseline.messages.includes(current.snapshot.messages[index] ?? "") &&
+      !baseline.texts.includes(digest(text)) && (!messageId || !baseline.messageIds.includes(messageId)) &&
+      !baseline.messages.includes(current.snapshot.messages[index] ?? "") &&
       (!original || (text !== original && !original.startsWith(`${text}\n\n`)))).map((message) => message.text).join("\n\n");
-    const freshMedia = current.snapshot.mediaKeys.some(key => !baseline.mediaKeys.includes(key) &&
+    const freshMedia = current.snapshot.mediaKeys.some((key, index) => !baseline.mediaHashes.includes(current.snapshot.mediaHashes[index] ?? "") &&
+      !baseline.mediaKeys.includes(key) &&
       !baseline.messageIds.some(message => digest(`message\n${message}`) === key) &&
       !baseline.presentations.some(presentation => digest(`presentation\n${presentation}`) === key));
-    const freshFiles = new Set(current.files.filter((file) => !baseline.files.includes(digest(file))));
+    const freshCards = current.fileCards.filter(card => !baseline.files.includes(digest(card.id)) &&
+      (!card.owner || !baseline.messageIds.includes(card.owner)));
+    const freshFiles = new Set(freshCards.map(card => card.id));
     const hasDelta = text || freshMedia || freshFiles.size;
     if (!hasDelta || current.generating || await page.evaluate(hasPendingMuseTask)) {
       candidates.delete(id);
@@ -175,7 +108,8 @@ export async function watchMusePage(page: Page, origin: URL, context: MuseWatchC
         cards: baseline.cards, messages: new Set(baseline.messageIds),
         sources: new Set(current.sources.filter((_src, i) => {
           const key = current.snapshot.mediaKeys[i] ?? "";
-          return baseline.mediaKeys.includes(key) || baseline.presentations.some(p => digest(`presentation\n${p}`) === key);
+          return baseline.mediaHashes.includes(current.snapshot.mediaHashes[i] ?? "") || baseline.mediaKeys.includes(key) ||
+            baseline.presentations.some(p => digest(`presentation\n${p}`) === key);
         })),
       })
       : { images: [], files: [], notes: [] };
@@ -187,6 +121,7 @@ export async function watchMusePage(page: Page, origin: URL, context: MuseWatchC
     const result = {
       text: body, remoteId: id, images: media.images, files, deliveryId: fingerprint,
       followupKeys: [
+        ...freshCards.map(card => digest(card.owner ? `message\n${card.owner}` : `file\n${card.id}`)),
         ...current.snapshot.messageIds.filter(m => !baseline.messageIds.includes(m)).map(m => digest(`message\n${m}`)),
         ...current.presentations.filter(p => !baseline.presentations.includes(p)).map(p => digest(`presentation\n${p}`)),
         ...current.snapshot.messages.filter(message => !baseline.messages.includes(message)),
@@ -203,6 +138,8 @@ export async function watchMusePage(page: Page, origin: URL, context: MuseWatchC
       mediaKeys: [...new Set([...baseline.mediaKeys, ...current.snapshot.mediaKeys])],
       presentations: [...new Set([...baseline.presentations, ...current.snapshot.presentations])],
       messageIds: [...new Set([...baseline.messageIds, ...current.snapshot.messageIds])],
+      mediaHashes: [...new Set([...baseline.mediaHashes, ...current.snapshot.mediaHashes])],
+      texts: [...new Set([...baseline.texts, ...current.snapshot.texts])],
     };
     candidates.delete(id);
     await save();
@@ -240,6 +177,7 @@ export async function watchMusePage(page: Page, origin: URL, context: MuseWatchC
   });
   const visit = async (path: string) => {
     await approvals.dispose();
+    sourceHashes.clear();
     const response = await page.goto(new URL(path, origin).href, { waitUntil: "domcontentloaded", timeout: 15_000 });
     if (response?.status() === 404) return false;
     return page.getByRole("log").waitFor({ state: "attached", timeout: 5_000 }).then(() => true, (error: unknown) => {

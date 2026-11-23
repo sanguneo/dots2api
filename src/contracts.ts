@@ -162,6 +162,7 @@ export interface MuseWatchThread {
 }
 export interface MuseWatchContext extends AdapterContext {
   readonly threads: readonly MuseWatchThread[];
+  readonly onWatchBaseline?: (threadId: string, mediaHashes: readonly string[]) => void;
   readonly onWatchApproval: (threadId: string | null, approval: JobApproval, choose: (choiceId: string) => Promise<boolean>) => () => void;
   readonly onWatchResult: (threadId: string, result: RunResult) => void;
 }

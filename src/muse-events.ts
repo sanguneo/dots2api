@@ -2,7 +2,7 @@ import { jobIdSchema } from "./contracts";
 import { GatewayError } from "./contracts";
 import type { AccountId, Job, MuseWatchContext, RunResult } from "./contracts";
 import type { Gateway } from "./gateway";
-import { followupContentHash, MuseFollowups } from "./muse-followups";
+import { followupContentHash, followupMediaHashes, MuseFollowups } from "./muse-followups";
 
 /** Idle browser ownership is released before any foreground account operation acquires the profile. */
 export class MuseEvents {
@@ -80,6 +80,7 @@ export class MuseEvents {
             threadId: job.remoteId ?? "", jobId: job.followup?.originJobId ?? job.id, output: job.output,
           })),
           saveCredentials: repaired => { this.gateway.store.saveAccount(this.gateway.account(account.id), repaired); },
+          onWatchBaseline: (threadId, hashes) => this.followups.baseline(account.id, threadId, hashes),
           onWatchApproval: (threadId, prompt, choose) => {
             const event = this.event(account.id, threadId);
             const withdrawn = Promise.withResolvers<void>();
@@ -148,7 +149,7 @@ export class MuseEvents {
     if (result.deliveryId && this.gateway.store.jobs(-1).some(job => job.accountId === accountId &&
       job.remoteId === threadId && job.followup?.deliveryId === result.deliveryId)) return;
     const contentHash = followupContentHash(result);
-    const claim = this.followups.claim(accountId, threadId, contentHash, result.followupKeys ?? []);
+    const claim = this.followups.claim(accountId, threadId, contentHash, result.followupKeys ?? [], Date.now(), followupMediaHashes(result));
     if (claim === "duplicate") return;
     if (claim === "paused") {
       console.warn(`[muse-events] follow-up rate limit; watcher paused account=${accountId} until=${new Date(this.followups.pausedUntil(accountId)).toISOString()}`);

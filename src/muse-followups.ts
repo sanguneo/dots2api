@@ -7,6 +7,10 @@ import type { Store } from "./store";
 const WINDOW_MS = 600_000;
 const digest = (data: string | Uint8Array) => createHash("sha256").update(data).digest("hex");
 
+export function followupMediaHashes(result: Pick<RunResult, "images" | "files">): readonly string[] {
+  return [...(result.images ?? []), ...(result.files ?? [])].map(media => digest(media.data));
+}
+
 /** Provider URLs, DOM ordering and job IDs are deliberately absent from this receipt. */
 export function followupContentHash(result: Pick<RunResult, "text" | "images" | "files">): string {
   return digest(JSON.stringify({
@@ -36,11 +40,20 @@ export class MuseFollowups {
     ).get(accountId)?.paused_until ?? 0;
   }
 
-  claim(accountId: AccountId, threadId: string, hash: string, keys: readonly string[], now = Date.now()): "claimed" | "duplicate" | "paused" {
+  baseline(accountId: AccountId, threadId: string, hashes: readonly string[]): void {
+    this.store.db.transaction(() => {
+      const insert = this.store.db.query("INSERT OR IGNORE INTO muse_followup_receipts VALUES (?,?,?,?,?)");
+      for (const hash of hashes) insert.run(accountId, threadId, "media", hash, 0);
+    }).immediate();
+  }
+
+  claim(accountId: AccountId, threadId: string, hash: string, keys: readonly string[], now = Date.now(),
+    mediaHashes: readonly string[] = []): "claimed" | "duplicate" | "paused" {
     const db = this.store.db;
     return db.transaction(() => {
       const seen = db.query("SELECT 1 FROM muse_followup_receipts WHERE account_id=? AND thread_id=? AND kind=? AND key=?");
       if (db.query("SELECT 1 FROM muse_followup_receipts WHERE account_id=? AND kind='content' AND key=?").get(accountId, hash) ||
+        mediaHashes.some(key => db.query("SELECT 1 FROM muse_followup_receipts WHERE account_id=? AND kind='media' AND key=?").get(accountId, key)) ||
         keys.some(key => seen.get(accountId, threadId, "presentation", key))) return "duplicate";
       if (this.pausedUntil(accountId) > now) return "paused";
       const recent = db.query<{ created_at: number }, [string, number]>(
@@ -54,6 +67,7 @@ export class MuseFollowups {
       const insert = db.query("INSERT INTO muse_followup_receipts VALUES (?,?,?,?,?)");
       insert.run(accountId, threadId, "content", hash, now);
       for (const key of new Set(keys)) insert.run(accountId, threadId, "presentation", key, now);
+      this.baseline(accountId, threadId, mediaHashes);
       return "claimed";
     }).immediate();
   }
@@ -63,15 +77,18 @@ export class MuseFollowups {
     const db = this.store.db;
     const insert = db.query("INSERT OR IGNORE INTO muse_followup_receipts VALUES (?,?,?,?,?)");
     for (const job of this.store.jobs(-1).reverse()) {
-      if (!job.followup || job.status !== "completed" || !job.remoteId || job.followup.contentHash) continue;
+      if (!job.followup || job.status !== "completed" || !job.remoteId) continue;
       const images = job.images.flatMap((_image, i) => {
         const image = this.store.image(job.id, i);
         return image ? [image] : [];
       });
-      const hash = followupContentHash({
+      const result = {
         text: job.output, images,
         files: (job.files ?? []).map((file, i) => ({ ...file, data: readFileSync(join(this.store.dataDir, "files", job.id, String(i))) })),
-      });
+      };
+      this.baseline(job.accountId, job.remoteId, followupMediaHashes(result));
+      if (job.followup.contentHash) continue;
+      const hash = followupContentHash(result);
       db.transaction(() => {
         const recorded = insert.run(job.accountId, job.remoteId, "content", hash, Date.parse(job.createdAt)).changes;
         this.store.saveJob({

@@ -55,3 +55,18 @@ test("legacy delivered payload suppresses the final unacknowledged rollback dupl
     expect(hashes[0]).toMatch(/^[a-f0-9]{64}$/);
   } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("baseline media survives database reopen without using the follow-up event budget", () => {
+  const dir = mkdtempSync(join(tmpdir(), "followup-baseline-"));
+  let store = new Store(dir);
+  try {
+    const account = store.createAccount("muse", "owner", {});
+    new MuseFollowups(store).baseline(account.id, "old-thread", ["old-image-bytes"]);
+    store.close();
+    store = new Store(dir);
+    const ledger = new MuseFollowups(store);
+    expect(ledger.claim(account.id, "renamed-thread", "new-caption", ["new-row"], 1000, ["old-image-bytes"])).toBe("duplicate");
+    expect([0, 1, 2, 3].map(i => ledger.claim(account.id, "thread", `new-content-${i}`, [`task-${i}`], 2000)))
+      .toEqual(["claimed", "claimed", "claimed", "paused"]);
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+});
