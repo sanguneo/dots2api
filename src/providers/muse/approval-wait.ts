@@ -7,6 +7,8 @@ import { APPROVAL_CARD_SELECTOR } from "./approval-dom";
 
 export interface ApprovalCard {
   readonly root: HTMLElement;
+  readonly identity: string;
+  readonly threadId: string | null;
   readonly description: string;
   readonly buttons: HTMLElement[];
   readonly labels: string[];
@@ -15,6 +17,12 @@ export interface ApprovalCard {
   menu?: HTMLElement;
 }
 const POLL_MS = 200;
+
+interface StandingApproval {
+  readonly register: (identity: string) => Promise<{ readonly id: string; readonly expiresAt: string } | null>;
+  readonly publish: (threadId: string | null, approval: JobApproval, choose: (choiceId: string) => Promise<boolean>) => () => void;
+  readonly clicked: (identity: string, threadId: string | null) => Promise<void>;
+}
 
 /** One page, one approval budget. Handles pin the actual controls, not an index in a mutable list. */
 export class ApprovalWait {
@@ -26,9 +34,14 @@ export class ApprovalWait {
     private readonly context: AdapterContext,
     private readonly scan: (rootSelector: string) => ApprovalCard | null,
     timeout: number,
+    private readonly standing?: StandingApproval,
   ) { this.#remaining = timeout; }
 
-  async dispose(): Promise<void> { await this.#answered?.dispose(); }
+  async dispose(): Promise<void> {
+    const answered = this.#answered;
+    this.#answered = undefined;
+    await answered?.dispose();
+  }
 
   private async loadMenu(card: JSHandle<ApprovalCard | null>): Promise<void> {
     const property = await card.getProperty("more");
@@ -74,10 +87,13 @@ export class ApprovalWait {
     const card = await this.page.evaluateHandle(this.scan, APPROVAL_CARD_SELECTOR);
     let keep = false;
     try {
-      const isNew = await card.evaluate((value, answered) => Boolean(value && (!answered || value.root !== answered.root ||
+      const match = await card.evaluate((value, answered) => value && (!answered || value.root !== answered.root ||
         value.description !== answered.description || !answered.current() ||
-        value.buttons.some((button, index) => button !== answered.buttons[index] || value.labels[index] !== answered.labels[index]))), this.#answered ?? null);
-      if (!isNew) return false;
+        value.buttons.some((button, index) => button !== answered.buttons[index] || value.labels[index] !== answered.labels[index]))
+        ? { identity: value.identity, threadId: value.threadId } : null, this.#answered ?? null);
+      if (!match) return false;
+      const registration = await this.standing?.register(match.identity);
+      if (this.standing && !registration) return false;
       await this.loadMenu(card);
       const summary = await card.evaluate((value, answered) => {
         if (!value || !value.current() || (answered && answered.current() && value.root === answered.root && value.description === answered.description &&
@@ -87,20 +103,20 @@ export class ApprovalWait {
       }, this.#answered ?? null);
       if (!summary) return false;
       await this.dispose();
-      this.#answered = undefined;
       const start = Date.now();
-      const deadline = start + this.#remaining;
+      const deadline = registration ? Date.parse(registration.expiresAt) : start + this.#remaining;
       const expired = () => new GatewayError("approval_timeout", "Muse approval expired without a choice.", 504);
-      if (this.#remaining <= 0) throw expired();
+      if (!this.standing && this.#remaining <= 0) throw expired();
+      if (this.standing && deadline <= start) return false;
       const approval: JobApproval = {
-        id: randomUUID(), description: summary.description,
+        id: registration?.id ?? randomUUID(), description: summary.description,
         choices: summary.labels.map((label, index) => ({ id: String(index), label })),
         expiresAt: new Date(deadline).toISOString(),
       };
       const decision = Promise.withResolvers<boolean>();
       let closing = false;
       let submitted = false;
-      const withdraw = this.context.onApproval?.(approval, async (choiceId) => {
+      const choose = async (choiceId: string) => {
         if (submitted || closing || this.context.signal.aborted || Date.now() >= deadline) return false;
         const index = approval.choices.findIndex((choice) => choice.id === choiceId);
         if (index < 0) return false;
@@ -120,9 +136,16 @@ export class ApprovalWait {
         } catch (error) {
           // A disconnected/navigated page cannot confirm a click. Never retarget it.
           if (!(error instanceof Error)) throw error;
-        } finally { decision.resolve(clicked); }
+        } finally {
+          try {
+            if (clicked) await this.standing?.clicked(match.identity, match.threadId);
+          } finally { decision.resolve(clicked); }
+        }
         return clicked;
-      });
+      };
+      const withdraw = this.standing
+        ? this.standing.publish(match.threadId, approval, choose)
+        : this.context.onApproval?.(approval, choose);
       try {
         for (;;) {
           this.context.signal.throwIfAborted();
@@ -131,10 +154,12 @@ export class ApprovalWait {
             keep = await decision.promise;
             if (keep) {
               this.#answered = card;
-            } else if (Date.now() >= deadline) throw expired();
+            } else if (!this.standing && Date.now() >= deadline) throw expired();
             return true;
           }
-          if (Date.now() >= deadline) throw expired();
+          if (Date.now() >= deadline) {
+            throw expired();
+          }
           const stillThere = await card.evaluate((value) => value !== null && value.current() &&
             value.buttons.every((button, index) => (value.root.contains(button) || value.menu?.contains(button)) &&
               button.isConnected && !button.matches(":disabled,[aria-disabled=true],[data-disabled]") &&

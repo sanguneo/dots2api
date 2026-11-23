@@ -1,4 +1,5 @@
 import type { Page } from "playwright";
+import { createHash } from "node:crypto";
 import { getMimeType } from "hono/utils/mime";
 import { MAX_FILE_BYTES, MAX_FILES } from "../../contracts";
 import type { RunFile, RunImage } from "../../contracts";
@@ -10,15 +11,44 @@ const FILE_END = "[[/file]]";
 
 interface Attachment {
   readonly src: string;
+  readonly presentation: string;
+  readonly message: string;
+  readonly beforeCurrentUser: boolean;
   readonly video: boolean;
   readonly width: number;
   readonly height: number;
+}
+export function mediaSourceIdentity(src: string): string {
+  const url = new URL(src);
+  if (url.protocol !== "https:" && url.protocol !== "http:") return src;
+  for (const key of [...url.searchParams.keys()]) {
+    if (/^(token|signature|sig|expires|policy|key-pair-id|auth|authorization|x-amz-.+|x-goog-.+)$/i.test(key)) url.searchParams.delete(key);
+  }
+  url.hash = "";
+  url.searchParams.sort();
+  return url.href;
+}
+
+export async function mediaBaseline(page: Page) {
+  const existing = await page.evaluate(() => ({
+    presentations: [...document.querySelectorAll('[data-testid^="hatch-chat-attachment-presentation-"]')].map(element => element.getAttribute("data-testid") ?? ""),
+    messages: [...document.querySelectorAll("[data-message-id]")].map(element => element.getAttribute("data-message-id") ?? ""),
+  }));
+  return {
+    sources: new Set((await page.evaluate(attachmentsInPage)).map(item => item.src)),
+    presentations: new Set(existing.presentations),
+    messages: new Set(existing.messages),
+    hashes: new Set<string>(),
+    cards: existing.presentations.length,
+    afterCurrentUser: true,
+  };
 }
 
 /** Runs in the browser; a file card's nested icon is never generated media. */
 export function attachmentsInPage(): Attachment[] {
   const result: Attachment[] = [];
   const seen = new Set<string>();
+  const currentUser = [...document.querySelectorAll('[data-message-item="true"][data-message-role="user"],div[class*="chat-user-bubble"]')].at(-1);
   document.querySelectorAll('[data-testid^="hatch-chat-attachment-presentation-"], div[class*="hatch-agent-bubble-bg"] img, div[class*="hatch-agent-bubble-bg"] video').forEach((element) => {
     if (element.closest('form,[data-hatch-composer-chrome],[class*=chat-user-bubble],[class*="group/msg"],[data-testid^="hatch-chat-file-card-"]')
       || element.querySelector('[data-testid^="hatch-chat-file-card-"]')) return;
@@ -29,6 +59,9 @@ export function attachmentsInPage(): Attachment[] {
     seen.add(src);
     result.push({
       src, video: video !== null,
+      presentation: element.closest('[data-testid^="hatch-chat-attachment-presentation-"]')?.getAttribute("data-testid") ?? "",
+      message: element.closest("[data-message-id]")?.getAttribute("data-message-id") ?? "",
+      beforeCurrentUser: Boolean(currentUser && element.compareDocumentPosition(currentUser) & Node.DOCUMENT_POSITION_FOLLOWING),
       width: video?.videoWidth || image?.naturalWidth || 0,
       height: video?.videoHeight || image?.naturalHeight || 0,
     });
@@ -75,8 +108,19 @@ async function mediaBytesInPage(src: string) {
   return { mime, b64 };
 }
 
-export async function generatedMedia(page: Page, baseline: { readonly sources: ReadonlySet<string>; readonly cards: number }) {
-  const collect = async () => (await page.evaluate(attachmentsInPage)).filter((item) => !baseline.sources.has(item.src) && !item.src.startsWith("data:image/svg"));
+export async function generatedMedia(page: Page, baseline: {
+  readonly sources: ReadonlySet<string>; readonly cards: number;
+  readonly presentations?: ReadonlySet<string>; readonly messages?: ReadonlySet<string>;
+  readonly hashes?: ReadonlySet<string>;
+  readonly afterCurrentUser?: boolean;
+}) {
+  const known = new Set([...baseline.sources].map(mediaSourceIdentity));
+  const collect = async () => (await page.evaluate(attachmentsInPage)).filter(item =>
+    !known.has(mediaSourceIdentity(item.src)) && !baseline.presentations?.has(item.presentation) &&
+    !baseline.messages?.has(item.message) &&
+    !baseline.hashes?.has(createHash("sha256").update(mediaSourceIdentity(item.src)).digest("hex")) &&
+    !(baseline.afterCurrentUser && item.beforeCurrentUser) &&
+    !item.src.startsWith("data:image/svg"));
   let fresh = await collect();
   if (!fresh.length) {
     const pending = await page.locator('[data-testid^="hatch-chat-attachment-presentation-"]').count() > baseline.cards;
@@ -116,7 +160,7 @@ export async function generatedMedia(page: Page, baseline: { readonly sources: R
       images.push({ mime, data, ...(item.width > 0 && item.height > 0 ? { width: item.width, height: item.height } : {}) });
     }
   }
-  return { images, files, notes };
+  return { images, files, notes, sources: fresh.map(item => item.src) };
 }
 
 export function fileBlock(name: string, data: Uint8Array): string {
@@ -127,13 +171,18 @@ export function fileBlock(name: string, data: Uint8Array): string {
 }
 
 /** The native Download action supplies the actual bytes, not the file viewer's preview. */
-export async function downloadFiles(page: Page, knownCards: number, limit = MAX_FILES) {
+export async function downloadFiles(page: Page, selection: number | ReadonlySet<string>, limit = MAX_FILES) {
   const cards = page.locator(FILE_CARD);
   const total = await cards.count();
   const blocks: string[] = [];
   const files: RunFile[] = [];
-  for (let index = knownCards; index < Math.min(total, knownCards + limit); index += 1) {
+  const ids: string[] = [];
+  let processed = 0;
+  for (let index = typeof selection === "number" ? selection : 0; index < total && processed < limit; index += 1) {
     const card = cards.nth(index);
+    if (typeof selection !== "number" && !selection.has(await card.getAttribute("data-testid", { timeout: 2_000 }).catch(() => null) ?? "")) continue;
+    ids.push(await card.getAttribute("data-testid", { timeout: 2_000 }) ?? "");
+    processed++;
     const title = await card.locator("[title]").first().getAttribute("title", { timeout: 2000 }).catch(() => null) ?? `file-${index + 1}`;
     try {
       await card.click({ timeout: 8000 });
@@ -172,5 +221,5 @@ export async function downloadFiles(page: Page, knownCards: number, limit = MAX_
     }
     await page.locator('button[aria-label="Close"]').first().click({ timeout: 2000 }).catch(() => {});
   }
-  return { blocks, files };
+  return { blocks, files, ids };
 }

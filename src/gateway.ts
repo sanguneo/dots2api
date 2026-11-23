@@ -3,6 +3,7 @@ import type { Account, AccountId, AdapterContext, Credentials, Job, JobApproval,
 import { validateReferenceImages } from "./images";
 import { Store } from "./store";
 import { MuseThreads } from "./muse-threads";
+import { MuseEvents } from "./muse-events";
 import type { DotsAuth } from "./dots-auth";
 
 /** Work one account may hold (running plus waiting) before submit refuses with 429 instead of growing without bound. */
@@ -47,6 +48,7 @@ export class Gateway {
   private readonly depths = new Map<AccountId, number>();
   private readonly now: () => number;
   readonly museThreads: MuseThreads;
+  readonly museEvents: MuseEvents;
   private sweepTimer: ReturnType<typeof setInterval> | undefined;
   private pruneTimer: ReturnType<typeof setInterval> | undefined;
   constructor(
@@ -57,6 +59,7 @@ export class Gateway {
   ) {
     this.now = options.now ?? Date.now;
     this.museThreads = new MuseThreads(this, options, this.shutdown.signal);
+    this.museEvents = new MuseEvents(this);
   }
 
   async credentials(id: AccountId, signal: AbortSignal): Promise<Credentials> {
@@ -80,6 +83,7 @@ export class Gateway {
     this.leases.add(done.promise);
     this.busy.add(id);
     this.leasesHeld.add(id);
+    void this.museEvents.pause(id);
     this.changed();
     let released = false;
     return () => {
@@ -96,6 +100,7 @@ export class Gateway {
   stop(): void {
     clearInterval(this.sweepTimer);
     clearInterval(this.pruneTimer);
+    this.museEvents.stop();
     this.shutdown.abort();
     for (const id of [...this.leaseWaiters.keys()]) this.wakeLeaseWaiters(id);
   }
@@ -119,7 +124,10 @@ export class Gateway {
     const next = this.depth(id) - 1;
     if (next > 0) this.depths.set(id, next); else this.depths.delete(id);
   }
-  async drain(): Promise<void> { await Promise.all([...this.leases]); }
+  async drain(): Promise<void> { await Promise.all([...this.leases, this.museEvents.drain()]); }
+  startMuseWatchers(): void { this.museEvents.start(); }
+  pauseMuseWatcher(id: AccountId): Promise<void> { return this.museEvents.pause(id); }
+  hasQueuedWork(id: AccountId): boolean { return this.depth(id) > 0 || this.chains.has(id); }
   accounts(): Account[] { return this.store.accounts().map((a) => ({ ...a, busy: this.busy.has(a.id) })); }
   /** Every registered provider with the operator's on/off switch applied. */
   providerStatuses(): ProviderStatus[] {
@@ -179,6 +187,7 @@ export class Gateway {
   async checkReserved(id: AccountId): Promise<Account> {
     const account = this.account(id);
     if (!account.busy) throw new GatewayError("account_not_reserved", "Connection check requires an account lease.", 409);
+    await this.pauseMuseWatcher(id);
     try {
       const adapter = this.adapters[account.provider];
       const signal = AbortSignal.any([this.shutdown.signal, AbortSignal.timeout(300_000)]);
@@ -233,7 +242,7 @@ export class Gateway {
       this.leases.add(done.promise);
       this.busy.add(id);
       this.changed();
-      try { return await work(); }
+      try { await this.pauseMuseWatcher(id); return await work(); }
       finally {
         this.busy.delete(id);
         this.leases.delete(done.promise);
@@ -358,6 +367,7 @@ export class Gateway {
         return this.abandon(current, "The account was not ready when this job's turn came; submit it again.");
       }
       this.busy.add(job.accountId);
+      await this.pauseMuseWatcher(job.accountId);
       // Registered as a lease so drain() waits for the run to be persisted before the process exits.
       const done = Promise.withResolvers<void>();
       this.leases.add(done.promise);
@@ -402,6 +412,21 @@ export class Gateway {
       pending.withdraw();
     }
   }
+  openApproval(job: Job, prompt: JobApproval, choose: LiveApproval["choose"]): () => void {
+    this.approvals.get(job.id)?.withdraw();
+    const withdraw = () => {
+      if (this.approvals.get(job.id) !== pending) return;
+      this.approvals.delete(job.id);
+      const current = this.store.job(job.id) ?? job;
+      if (current.status === "approval_required") this.store.saveJob({ ...current, status: "running", approval: undefined });
+      this.changed();
+    };
+    const pending: LiveApproval = { prompt, choose, withdraw, submitting: false };
+    this.approvals.set(job.id, pending);
+    this.store.saveJob({ ...(this.store.job(job.id) ?? job), status: "approval_required", approval: prompt });
+    this.changed();
+    return withdraw;
+  }
   private async execute(job: Job, referenceImages?: readonly ReferenceImage[], side?: SideChat): Promise<Job> {
     let remoteId: string | null = null;
     // Only Muse has side chats. A keyless request owns its chat: `job:<id>` can never match another request.
@@ -421,18 +446,7 @@ export class Gateway {
         ...(sideChat?.thread ? { retryAccepted: false } : {}),
         saveCredentials: (repaired) => { this.store.saveAccount(this.account(job.accountId), repaired); },
         onApproval: (prompt, choose) => {
-          this.approvals.get(job.id)?.withdraw();
-          const withdraw = () => {
-            if (this.approvals.get(job.id) !== pending) return;
-            this.approvals.delete(job.id);
-            this.store.saveJob({ ...job, remoteId, status: "running" });
-            this.changed();
-          };
-          const pending: LiveApproval = { prompt, choose, withdraw, submitting: false };
-          this.approvals.set(job.id, pending);
-          this.store.saveJob({ ...job, remoteId, status: "approval_required", approval: prompt });
-          this.changed();
-          return withdraw;
+          return this.openApproval({ ...job, remoteId }, prompt, choose);
         },
         onAccepted: (id) => {
           remoteId = id;
@@ -469,11 +483,12 @@ export class Gateway {
       }
       // Finished side chats renew their idle window; keyed accepted chats are already persisted above.
       // A keyless chat was already deleted by the worker; a failed deletion there leaves it for the operator.
-      if (sideChat && key && result.remoteId && (sideChat.kind === "image" || sideChat.thread)) {
+      if (sideChat && key && result.remoteId && (sideChat.kind === "image" || sideChat.thread || result.pendingTask)) {
         this.store.saveMuseThread({ accountId: job.accountId, kind: sideChat.kind, key, threadId: result.remoteId, lastUsedAt: this.now() });
       }
       return this.store.saveJob({
-        ...job, status: "completed", output: result.text + note, remoteId: result.remoteId, images, files, finishedAt: new Date().toISOString(),
+        ...job, status: "completed", output: result.text + note, remoteId: result.remoteId, images, files,
+        ...(result.pendingTask ? { pendingTask: true } : {}), finishedAt: new Date().toISOString(),
       });
     } catch (error) {
       const uncertain = !(error instanceof GatewayError) || error.uncertain;

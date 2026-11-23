@@ -2,12 +2,12 @@
 export function observeCompletion({ knownAttachments, approvalSelector }: { readonly knownAttachments: number; readonly approvalSelector: string }): void {
   let seenStop = false;
   const root = document.documentElement;
-  const stopSelector = '[data-testid="hatch-composer-stop-button"], button[aria-label*="Stop" i], button[aria-label*="\u{505c}\u{6b62}"]';
+  const stopSelector = '[data-testid="hatch-composer-stop-button"], button[aria-label*="Stop" i], button[aria-label*="停止"], button[aria-label*="중지"]';
   const bubbleSelector = 'div[class*="hatch-agent-bubble-bg"]';
   const previous = new Map([...document.querySelectorAll(bubbleSelector)].map((bubble) => [bubble, bubble.textContent]));
   let attachmentBaseline = knownAttachments;
   const observe = () => {
-    const stop = [...document.querySelectorAll(stopSelector)].find((el) => !/task|\u{4efb}\u{52a1}/iu.test(el.getAttribute("aria-label") ?? "")) ?? null;
+    const stop = [...document.querySelectorAll(stopSelector)].find((el) => !/task|任务|작업/iu.test(el.getAttribute("aria-label") ?? "")) ?? null;
     if ([...document.querySelectorAll(approvalSelector)].some((card) => card.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true }))) {
       seenStop = Boolean(stop);
       previous.clear();
@@ -29,4 +29,11 @@ export function observeCompletion({ knownAttachments, approvalSelector }: { read
   };
   new MutationObserver(observe).observe(document.body, { childList: true, subtree: true, attributes: true, characterData: true });
   observe();
+}
+/** Muse has distinct Stop controls for chat streaming and delegated tasks. */
+export function hasPendingMuseTask(): boolean {
+  return [...document.querySelectorAll('button[aria-label*="Stop" i], button[aria-label*="停止"], button[aria-label*="중지"]')]
+    .some((element) => /task|任务|작업/iu.test(element.getAttribute("aria-label") ?? "") &&
+      !element.matches(":disabled,[aria-disabled=true]") &&
+      element.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true }));
 }

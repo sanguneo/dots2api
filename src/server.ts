@@ -78,6 +78,7 @@ const server = Bun.serve<ViewerData>({
 console.log(`dots2api ready at ${server.url}`);
 console.log("Open the local console to connect accounts. Credentials are stored encrypted in data/.");
 gateway.startSweeper();
+gateway.startMuseWatchers();
 // A restart can leave an account in error; re-verify those the way the Check button does.
 void gateway.recheckErroredAccounts().then((recovered) => { if (recovered > 0) console.log(`Re-checked accounts at startup: ${recovered} back in rotation.`); });
 

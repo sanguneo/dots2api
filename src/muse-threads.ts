@@ -21,6 +21,11 @@ export class MuseThreads {
 
   isDeleting(key: string): boolean { return this.deleting.has(key); }
   private due(thread: MuseThread): boolean {
+    if (this.gateway.store.jobs(-1).some(job => job.accountId === thread.accountId &&
+      job.remoteId === thread.threadId && job.pendingTask)) return false;
+    if (this.gateway.museEvents.pending().some(job => job.accountId === thread.accountId &&
+      (job.remoteId === thread.threadId || job.remoteId === null) &&
+      (job.status === "approval_required" || job.status === "running"))) return false;
     const idle = thread.kind === "image"
       ? this.options.imageIdleMs ?? IMAGE_IDLE_MS
       : this.options.chatIdleMs ?? CHAT_IDLE_MS;

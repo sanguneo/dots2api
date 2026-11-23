@@ -34,6 +34,7 @@ export class MuseLoginRoutes {
       if (this.leases.has(id)) throw new GatewayError("muse_login_state", "A login session is already active for this account.", 409);
       this.leases.set(id, this.gateway.reserve(id));
       try {
+        await this.gateway.pauseMuseWatcher(id);
         return c.json({ session: await this.service.start(id) });
       } catch (error) {
         this.release(id);
