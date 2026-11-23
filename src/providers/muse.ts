@@ -7,6 +7,7 @@ import type { AdapterContext, CheckResult, Credentials, MuseWatchContext, Provid
 import { createMuseAdapter as createBrowserAdapter, sanitizeDiagnostics } from "./muse/engine";
 import { approvalResultSchema, EVENT_LIMIT, jsonLines, readStream, REQUEST_LIMIT, workerProtocolError } from "./muse/ipc";
 import type { ApprovalCommand } from "./muse/ipc";
+import { nodeExecutable } from "./muse/node-runtime";
 
 const MAX_ATTEMPTS = 2;
 const WORKER_LOG_LIMIT = 256 * 1024;
@@ -42,6 +43,7 @@ const imageSchema = z.object({
 const resultFields = {
   text: z.string(), remoteId: z.string().nullable(), images: z.array(imageSchema).default([]), pendingTask: z.boolean().optional(),
   deliveryId: z.string().max(128).optional(),
+  followupKeys: z.array(z.string().max(128)).max(512).optional(),
 };
 const eventSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("submitted") }),
@@ -55,6 +57,7 @@ const eventSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("file"), name: z.string(), mime: z.string(), dataB64: z.string().max(Math.ceil(MAX_FILE_BYTES / 3) * 4) }),
   z.object({ type: z.literal("completed"), ...resultFields }),
   z.object({ type: z.literal("watch_result"), threadId: z.string(), ...resultFields }),
+  z.object({ type: z.literal("watch_baseline"), threadId: z.string(), hashes: z.array(z.string().regex(/^[a-f0-9]{64}$/)).max(512) }),
   z.object({ type: z.literal("watched") }),
   z.object({ type: z.literal("failed"), code: z.string(), message: z.string(), status: z.number(), uncertain: z.boolean() }),
 ]);
@@ -75,6 +78,7 @@ function runResult(result: z.infer<z.ZodObject<typeof resultFields>>, files: rea
     text: result.text, remoteId: result.remoteId,
     ...(result.pendingTask ? { pendingTask: true } : {}),
     ...(result.deliveryId ? { deliveryId: result.deliveryId } : {}),
+    ...(result.followupKeys ? { followupKeys: result.followupKeys } : {}),
     ...(images.length ? { images } : {}),
     ...(files.length ? { files } : {}),
   };
@@ -97,19 +101,14 @@ function workerProgram(): Promise<string> {
 // A service manager's PATH is not the interactive shell's PATH, so report a missing or too-old node
 // as the runtime problem it is instead of blaming the user's Node.js installation.
 let resolvedNode: string | undefined;
-function nodeBinary(): string {
+async function nodeBinary(): Promise<string> {
   if (resolvedNode) return resolvedNode;
   const node = Bun.which("node");
   if (!node) {
     throw new GatewayError("muse_runtime", "The Muse browser worker needs Node.js 22 or newer, but no \"node\" was found on the gateway service PATH.", 503);
   }
-  const version = new TextDecoder().decode(Bun.spawnSync([node, "-v"], { stdout: "pipe" }).stdout).trim();
-  const major = Number(/^v?(\d+)/.exec(version)?.[1] ?? "");
-  if (!Number.isInteger(major) || major < 22) {
-    throw new GatewayError("muse_runtime", `The Muse browser worker needs Node.js 22 or newer, but the gateway service PATH provides Node.js ${version || node}.`, 503);
-  }
-  resolvedNode = node;
-  return node;
+  resolvedNode = await nodeExecutable(node);
+  return resolvedNode;
 }
 
 /** Fixed per adapter and sent to every worker over stdin; the worker never reads the gateway's environment. */
@@ -128,7 +127,7 @@ async function callWorker(
   context: AdapterContext,
   watch?: MuseWatchContext,
 ): Promise<WorkerReply> {
-  const node = nodeBinary();
+  const node = await nodeBinary();
   const source = await workerProgram();
   if (context.signal.aborted) throw new GatewayError("muse_cancelled", "Muse operation cancelled.", 409);
   const request = JSON.stringify({
@@ -241,6 +240,10 @@ async function callWorker(
             if (!watch) throw workerProtocolError();
             // A verified frame already produced by the browser must survive account preemption.
             watch.onWatchResult(event.threadId, runResult(event, files.splice(0)));
+            break;
+          case "watch_baseline":
+            if (!watch) throw workerProtocolError();
+            watch.onWatchBaseline?.(event.threadId, event.hashes);
             break;
         }
     }

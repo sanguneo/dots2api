@@ -120,6 +120,49 @@ test("foreground work waits until the idle watcher releases the account browser"
   } finally { release.resolve(); await f.close(); }
 });
 
+test("identical follow-up bytes survive changing delivery IDs and gateway restart", async () => {
+  let published = Promise.withResolvers<void>();
+  const f = await fixture(async context => {
+    for (let i = 0; i < 4; i++) context.onWatchResult("origin-thread", {
+      text: "Finished side task", remoteId: "origin-thread", deliveryId: `unstable-snapshot-${i}`,
+      files: [{ name: "result.txt", mime: "text/plain", data: new TextEncoder().encode("same bytes") }],
+    });
+    published.resolve();
+    await new Promise<void>(resolve => context.signal.addEventListener("abort", () => resolve(), { once: true }));
+  });
+  try {
+    f.gateway.startMuseWatchers();
+    await published.promise;
+    expect(f.store.jobs(-1).filter(job => job.followup && job.status === "completed")).toHaveLength(1);
+    f.gateway.stop();
+    await f.gateway.drain();
+    const restarted = new Gateway(f.store, f.gateway.adapters);
+    try {
+      published = Promise.withResolvers<void>();
+      restarted.startMuseWatchers();
+      await published.promise;
+      expect(f.store.jobs(-1).filter(job => job.followup && job.status === "completed")).toHaveLength(1);
+    } finally { restarted.stop(); await restarted.drain(); }
+  } finally { await f.close(); }
+});
+
+test("the fourth distinct follow-up pauses the account watcher", async () => {
+  const published = Promise.withResolvers<void>();
+  const f = await fixture(async context => {
+    for (let i = 0; i < 5; i++) context.onWatchResult("origin-thread", {
+      text: `Distinct task ${i}`, remoteId: "origin-thread", deliveryId: `result-${i}`,
+    });
+    published.resolve();
+    if (context.signal.aborted) return;
+    await new Promise<void>(resolve => context.signal.addEventListener("abort", () => resolve(), { once: true }));
+  });
+  try {
+    f.gateway.startMuseWatchers();
+    await published.promise;
+    expect(f.store.jobs(-1).filter(job => job.followup && job.status === "completed")).toHaveLength(3);
+  } finally { await f.close(); }
+});
+
 test("unlinked account approvals do not claim the most recent request as their origin", async () => {
   const published = Promise.withResolvers<void>();
   const approval = {

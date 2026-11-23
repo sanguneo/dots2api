@@ -85,6 +85,7 @@ export interface Job {
     readonly originJobId: JobId | null;
     readonly deliveredAt: string | null;
     readonly deliveryId?: string | undefined;
+    readonly contentHash?: string | undefined;
   } | undefined;
   readonly pendingTask?: boolean | undefined;
   readonly remoteId: string | null;
@@ -131,6 +132,7 @@ export interface RunResult {
   readonly files?: readonly RunFile[];
   readonly pendingTask?: boolean;
   readonly deliveryId?: string;
+  readonly followupKeys?: readonly string[];
 }
 export interface AdapterContext {
   readonly accountId: AccountId;
@@ -160,6 +162,7 @@ export interface MuseWatchThread {
 }
 export interface MuseWatchContext extends AdapterContext {
   readonly threads: readonly MuseWatchThread[];
+  readonly onWatchBaseline?: (threadId: string, mediaHashes: readonly string[]) => void;
   readonly onWatchApproval: (threadId: string | null, approval: JobApproval, choose: (choiceId: string) => Promise<boolean>) => () => void;
   readonly onWatchResult: (threadId: string, result: RunResult) => void;
 }

@@ -9,14 +9,15 @@ import { createMuseAdapter } from "../src/providers/muse";
 const oldImage = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==", "base64");
 const newImage = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAEklEQVR4nGP8z8DwnwEJMCJzADxmBAHdI2kgAAAAAElFTkSuQmCC", "base64");
 
-test.each(["rotated-url", "placeholder", "late-history", "late-row"])("a text reply excludes an old side-task image when history uses %s", async history => {
+test.each(["rotated-url", "placeholder", "late-history", "late-row", "unavailable-history"])("a text reply excludes an old side-task image when history uses %s", async history => {
   const dataDir = await mkdtemp(join(tmpdir(), "muse-media-history-"));
   const server = Bun.serve({
     hostname: "127.0.0.1", port: 0,
     fetch(request) {
       const path = new URL(request.url).pathname;
       if (path === "/api/session") return Response.json({ status: "assigned" });
-      if (path === "/old.png") return new Response(oldImage, { headers: { "content-type": "image/png" } });
+      if (path === "/old.png") return history === "unavailable-history" ? new Response(null, { status: 404 }) :
+        new Response(oldImage, { headers: { "content-type": "image/png" } });
       const presentation = '<div data-testid="hatch-chat-attachment-presentation-old"></div>';
       return new Response(`<!doctype html><html><body>
         <textarea></textarea><button aria-label="Send">Send</button><main role="log">
@@ -25,7 +26,7 @@ test.each(["rotated-url", "placeholder", "late-history", "late-row"])("a text re
           </div>`}
         </main><script>
           const old = document.querySelector('[data-message-id="old-side-result"]') ?? document.createElement('div');
-          ${history === "rotated-url" ? `old.querySelector('div').innerHTML = '<img src="/old.png?token=before">';` : ""}
+          ${history === "rotated-url" || history === "unavailable-history" ? `old.querySelector('div').innerHTML = '<img src="/old.png?token=before">';` : ""}
           document.querySelector('button').onclick = () => {
             document.querySelector('main').insertAdjacentHTML('beforeend',
               '<div class="chat-user-bubble">Hello</div><button aria-label="Stop">Stop</button>');
@@ -72,6 +73,8 @@ test("a side-task image is delivered once and never attached to the next text re
       if (path === "/api/session") return Response.json({ status: "assigned" });
       if (path === "/side.png") return new Response(oldImage, { headers: { "content-type": "image/png" } });
       if (path === "/submit") { turn++; return Response.json({ turn }); }
+      // Finish after the watcher's first baseline, when its route loop reaches home.
+      if (path === "/" && turn === 1) sideDone = true;
       // The old image is deliberately absent when the next foreground page hydrates.
       const content = path === "/thread/origin" ? (turn ? historical : "") + (sideDone ? sideText : "") : "";
       return new Response(`<!doctype html><html><body><textarea></textarea><button aria-label="Send">Send</button>
@@ -99,7 +102,6 @@ test("a side-task image is delivered once and never attached to the next text re
   try {
     const context = { accountId, dataDir, threadId: "origin", signal: AbortSignal.timeout(25_000) };
     expect((await adapter.run({}, "Start side work", context)).pendingTask).toBe(true);
-    sideDone = true;
     if (!adapter.watch) throw new Error("Missing Muse watcher");
     watching = adapter.watch({}, {
       accountId, dataDir, signal: AbortSignal.any([abort.signal, AbortSignal.timeout(15_000)]),

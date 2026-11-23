@@ -1,73 +1,16 @@
-import { createHash, randomUUID } from "node:crypto";
-import { readFile, rename, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import type { Page } from "playwright";
-import { z } from "zod";
 import { GatewayError, MAX_FILES } from "../../contracts";
 import type { MuseWatchContext } from "../../contracts";
 import { APPROVAL_CARD_SELECTOR, scanApprovalCard } from "./approval-dom";
 import { ApprovalWait } from "./approval-wait";
 import { hasPendingMuseTask } from "./completion";
-import { attachmentsInPage, downloadFiles, FILE_CARD, generatedMedia, mediaSourceIdentity } from "./media";
+import { attachmentsInPage, downloadFiles, generatedMedia } from "./media";
+import { followupContentHash } from "../../muse-followups";
+import { digest, mediaIdentity, readState, readTranscript, saveState } from "./watch-state";
 
 const threadId = /^[A-Za-z0-9_-]{1,128}$/;
-const snapshotSchema = z.object({
-  messages: z.array(z.string()), sources: z.array(z.string()), cards: z.number(), files: z.array(z.string()),
-  users: z.array(z.string()),
-});
-const approvalSchema = z.object({
-  id: z.uuid(), expiresAt: z.iso.datetime(), clicked: z.boolean(),
-});
-const stateSchema = z.object({
-  approvals: z.record(z.string(), approvalSchema),
-  captures: z.record(z.string(), snapshotSchema),
-  targets: z.array(z.string()).default([]),
-});
-type Snapshot = z.infer<typeof snapshotSchema>;
-const digest = (value: string) => createHash("sha256").update(value).digest("hex");
-
-type WatchState = z.infer<typeof stateSchema>;
-
-async function readState(path: string): Promise<WatchState> {
-  try {
-    return stateSchema.parse(JSON.parse(await readFile(path, "utf8")));
-  } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "ENOENT") return { approvals: {}, captures: {}, targets: [] };
-    throw error;
-  }
-}
-
-async function saveState(path: string, state: WatchState): Promise<void> {
-  const temporary = `${path}.tmp`;
-  await writeFile(temporary, JSON.stringify(state), { mode: 0o600 });
-  await rename(temporary, path);
-}
-
-const mediaIdentity = (src: string) => digest(mediaSourceIdentity(src));
-
-async function readTranscript(page: Page) {
-  const contents = await page.evaluate(({ fileSelector }) => {
-    const bubbles = [...document.querySelectorAll<HTMLElement>('div[class*="hatch-agent-bubble-bg"]')];
-    return {
-      messages: bubbles.map((bubble) => ({
-        id: bubble.closest("[data-message-id]")?.getAttribute("data-message-id") ?? "",
-        text: bubble.innerText.trim(),
-      })),
-      cards: document.querySelectorAll('[data-testid^="hatch-chat-attachment-presentation-"]').length,
-      files: [...document.querySelectorAll(fileSelector)].flatMap((element) => element.getAttribute("data-testid") ?? []),
-      users: [...document.querySelectorAll<HTMLElement>('[data-message-item="true"][data-message-role="user"],div[class*="chat-user-bubble"]')]
-        .map((element) => `${element.getAttribute("data-message-id") ?? ""}\n${element.innerText.trim()}`),
-      generating: Boolean(document.querySelector('[data-testid="hatch-composer-stop-button"],button[aria-label="Stop"]')),
-    };
-  }, { fileSelector: FILE_CARD });
-  const sources = (await page.evaluate(attachmentsInPage)).filter(({ src }) => !src.startsWith("data:image/svg")).map(({ src }) => src);
-  const snapshot = {
-    messages: contents.messages.map(({ id, text }) => digest(`${id}\n${text}`)),
-    sources: sources.map(mediaIdentity), cards: contents.cards, files: contents.files.map(digest), users: contents.users.map(digest),
-  };
-  return { ...contents, sources, snapshot };
-}
-
 /** Snapshot the delivered turn before foreground teardown so a fast follow-up is not mistaken for history. */
 export async function rememberMuseTranscript(page: Page, statePath: string, id: string, delivered?: {
   readonly message: { readonly id: string; readonly text: string } | null;
@@ -92,6 +35,11 @@ export async function rememberMuseTranscript(page: Page, statePath: string, id: 
       sources: [...new Set([...(previous?.sources ?? []), ...historical.map(item => mediaIdentity(item.src)), ...delivered.sources.map(mediaIdentity)])],
       files: [...new Set([...(previous?.files ?? []), ...delivered.files.map(digest)])],
       cards: current.cards, users: current.users,
+      mediaKeys: [...new Set([...(previous?.mediaKeys ?? []), ...current.mediaKeys])],
+      presentations: [...new Set([...(previous?.presentations ?? []), ...current.presentations])],
+      messageIds: [...new Set([...(previous?.messageIds ?? []), ...current.messageIds])],
+      mediaHashes: [...new Set([...(previous?.mediaHashes ?? []), ...current.mediaHashes])],
+      texts: [...new Set([...(previous?.texts ?? []), ...current.texts])],
     };
   }
   await saveState(statePath, state);
@@ -106,29 +54,73 @@ export async function watchMusePage(page: Page, origin: URL, context: MuseWatchC
   const targets = new Set([...threads.keys(), ...state.targets.filter(id => threadId.test(id) && id !== "new")]);
   const preflighted = new Set<string>();
   const candidates = new Map<string, { readonly fingerprint: string; readonly since: number }>();
+  const baselined = new Set<string>();
+  const sourceHashes = new Map<string, string>();
   const activePath = () => /^\/thread\/([A-Za-z0-9_-]{1,128})\/?$/.exec(new URL(page.url()).pathname)?.[1] ?? null;
 
   const capture = async (id: string) => {
-    const current = await readTranscript(page);
+    const current = await readTranscript(page, sourceHashes);
+    // URLs are transport handles, never evidence of a new presentation.
+    const fingerprint = digest(JSON.stringify({ ...current.snapshot, sources: [] }));
     const baseline = state.captures[id];
-    if (!baseline) {
+    if (!baselined.has(id) || !baseline) {
       if (current.generating) return;
+      const candidate = candidates.get(id);
+      if (candidate?.fingerprint !== fingerprint) {
+        candidates.set(id, { fingerprint, since: Date.now() });
+        return;
+      }
+      // The log mounts before history; real Muse also mounts messages before blob images.
+      if (Date.now() - candidate.since < 3_000) return;
       state.captures[id] = current.snapshot;
+      baselined.add(id);
       candidates.delete(id);
       await save();
+      context.onWatchBaseline?.(id, current.snapshot.mediaHashes);
       return;
     }
+    // Historical rows can acquire bytes later, then be remounted under new DOM identities.
+    // Learn that evidence before any no-delta or pending-task return.
+    const historical = current.media.filter(item => {
+      const knownOwner = baseline.mediaKeys.includes(item.key) || baseline.messageIds.includes(item.owner) ||
+        baseline.presentations.includes(item.presentation);
+      const knownBytes = item.hash !== null && baseline.mediaHashes.includes(item.hash);
+      const newCaption = current.messages.some(message => message.id === item.owner && message.text &&
+        !baseline.texts.includes(digest(message.text)));
+      return knownOwner || (knownBytes && !newCaption);
+    });
+    const hashes = [...new Set(historical.flatMap(item => item.hash ? [item.hash] : []))]
+      .filter(hash => !baseline.mediaHashes.includes(hash));
+    const keys = [...new Set(historical.map(item => item.key))].filter(key => !baseline.mediaKeys.includes(key));
+    const owners = [...new Set(historical.map(item => item.owner))].filter(owner => owner && !baseline.messageIds.includes(owner));
+    const presentations = [...new Set(historical.map(item => item.presentation))]
+      .filter(presentation => presentation && !baseline.presentations.includes(presentation));
+    if (hashes.length || keys.length || owners.length || presentations.length) {
+      baseline.mediaHashes.push(...hashes);
+      baseline.mediaKeys.push(...keys);
+      baseline.messageIds.push(...owners);
+      baseline.presentations.push(...presentations);
+      await save();
+      if (hashes.length) context.onWatchBaseline?.(id, hashes);
+    }
     const original = threads.get(id)?.output.trim();
-    const text = current.messages.filter(({ text }, index) => text && !baseline.messages.includes(current.snapshot.messages[index] ?? "") &&
+    const text = current.messages.filter(({ id: messageId, text }, index) => text &&
+      !baseline.texts.includes(digest(text)) && (!messageId || !baseline.messageIds.includes(messageId)) &&
+      !baseline.messages.includes(current.snapshot.messages[index] ?? "") &&
       (!original || (text !== original && !original.startsWith(`${text}\n\n`)))).map((message) => message.text).join("\n\n");
-    const freshMedia = current.snapshot.sources.some((src) => !baseline.sources.includes(src));
-    const freshFiles = new Set(current.files.filter((file) => !baseline.files.includes(digest(file))));
+    const freshMedia = current.snapshot.mediaKeys.some((key, index) => !baseline.mediaHashes.includes(current.snapshot.mediaHashes[index] ?? "") &&
+      !baseline.mediaKeys.includes(key) &&
+      !baseline.messageIds.some(message => digest(`message\n${message}`) === key) &&
+      !baseline.presentations.some(presentation => digest(`presentation\n${presentation}`) === key));
+    const freshCards = current.fileCards.filter(card => !baseline.files.includes(digest(card.id)) &&
+      (!card.owner || !baseline.messageIds.includes(card.owner)) &&
+      (!card.presentation || !baseline.presentations.includes(card.presentation)));
+    const freshFiles = new Set(freshCards.map(card => card.id));
     const hasDelta = text || freshMedia || freshFiles.size;
     if (!hasDelta || current.generating || await page.evaluate(hasPendingMuseTask)) {
       candidates.delete(id);
       return;
     }
-    const fingerprint = digest(JSON.stringify(current.snapshot));
     const candidate = candidates.get(id);
     if (candidate?.fingerprint !== fingerprint) {
       candidates.set(id, { fingerprint, since: Date.now() });
@@ -137,17 +129,58 @@ export async function watchMusePage(page: Page, origin: URL, context: MuseWatchC
     // Presentations can land in a distinct row a moment after the text message.
     if (Date.now() - candidate.since < 1_000) return;
     const media = freshMedia
-      ? await generatedMedia(page, { cards: baseline.cards, sources: new Set(current.sources.filter((src) => baseline.sources.includes(mediaIdentity(src)))) })
+      ? await generatedMedia(page, {
+        cards: baseline.cards, messages: new Set(baseline.messageIds),
+        sources: new Set(current.sources.filter((_src, i) => {
+          const key = current.snapshot.mediaKeys[i] ?? "";
+          return baseline.mediaHashes.includes(current.snapshot.mediaHashes[i] ?? "") || baseline.mediaKeys.includes(key) ||
+            baseline.presentations.some(p => digest(`presentation\n${p}`) === key);
+        })),
+      })
       : { images: [], files: [], notes: [] };
     const downloaded = await downloadFiles(page, freshFiles, MAX_FILES - media.files.length);
     const body = [text, ...media.notes, ...downloaded.blocks].filter(Boolean).join("\n\n");
     const files = [...media.files, ...downloaded.files];
     if (!body && !media.images.length && !files.length) return;
     context.signal.throwIfAborted();
-    context.onWatchResult(id, { text: body, remoteId: id, images: media.images, files, deliveryId: fingerprint });
-    state.captures[id] = current.snapshot;
+    const result = {
+      text: body, remoteId: id, images: media.images, files, deliveryId: fingerprint,
+      followupKeys: [
+        ...freshCards.map(card => digest(card.owner ? `message\n${card.owner}` :
+          card.presentation ? `presentation\n${card.presentation}` : `file\n${card.id}`)),
+        ...current.snapshot.messageIds.filter(m => !baseline.messageIds.includes(m)).map(m => digest(`message\n${m}`)),
+        ...current.presentations.filter(p => !baseline.presentations.includes(p)).map(p => digest(`presentation\n${p}`)),
+        ...current.snapshot.messages.filter(message => !baseline.messages.includes(message)),
+      ],
+    };
+    const hash = followupContentHash(result);
+    const duplicate = state.deliveredHashes.includes(hash);
+    if (!duplicate) state.deliveredHashes.push(hash);
+    state.captures[id] = {
+      ...current.snapshot,
+      messages: [...new Set([...baseline.messages, ...current.snapshot.messages])],
+      sources: [...new Set([...baseline.sources, ...current.snapshot.sources])],
+      files: [...new Set([...baseline.files, ...current.snapshot.files])],
+      mediaKeys: [...new Set([...baseline.mediaKeys, ...current.snapshot.mediaKeys])],
+      presentations: [...new Set([...baseline.presentations, ...current.snapshot.presentations])],
+      messageIds: [...new Set([...baseline.messageIds, ...current.snapshot.messageIds])],
+      mediaHashes: [...new Set([...baseline.mediaHashes, ...current.snapshot.mediaHashes])],
+      texts: [...new Set([...baseline.texts, ...current.snapshot.texts])],
+    };
     candidates.delete(id);
     await save();
+    context.signal.throwIfAborted();
+    if (!duplicate) context.onWatchResult(id, result);
+  };
+
+  const establishBaseline = async (id: string) => {
+    const deadline = Date.now() + 30_000;
+    while (!baselined.has(id)) {
+      context.signal.throwIfAborted();
+      if (Date.now() >= deadline) throw new GatewayError("muse_watch_baseline", "Muse transcript did not finish its initial baseline.", 502);
+      await capture(id);
+      if (!baselined.has(id)) await delay(250, undefined, { signal: context.signal });
+    }
   };
 
   const approvals = new ApprovalWait(page, context, scanApprovalCard, approvalTimeout, {
@@ -170,6 +203,7 @@ export async function watchMusePage(page: Page, origin: URL, context: MuseWatchC
   });
   const visit = async (path: string) => {
     await approvals.dispose();
+    sourceHashes.clear();
     const response = await page.goto(new URL(path, origin).href, { waitUntil: "domcontentloaded", timeout: 15_000 });
     if (response?.status() === 404) return false;
     return page.getByRole("log").waitFor({ state: "attached", timeout: 5_000 }).then(() => true, (error: unknown) => {
@@ -183,7 +217,7 @@ export async function watchMusePage(page: Page, origin: URL, context: MuseWatchC
     // Snapshot actual DOM before any owner decision, including images/files already delivered
     // with the kickoff. Do not reconstruct earlier output from the latest chat.
     for (const id of targets) {
-      if (!state.captures[id] && await visit(`/thread/${id}`) && activePath() === id) await capture(id);
+      if (await visit(`/thread/${id}`) && activePath() === id) await establishBaseline(id);
     }
     let next = 0;
     while (!context.signal.aborted) {
@@ -204,7 +238,7 @@ export async function watchMusePage(page: Page, origin: URL, context: MuseWatchC
           // No token has been published yet. Baseline the explicit source, then pin a fresh handle
           // only if the same provider request still owns the card on return.
           const returnTo = new URL(page.url()).pathname;
-          if (await visit(`/thread/${source}`) && activePath() === source) await capture(source);
+          if (await visit(`/thread/${source}`) && activePath() === source) await establishBaseline(source);
           await visit(returnTo);
           const returned = await page.evaluateHandle(scanApprovalCard, APPROVAL_CARD_SELECTOR);
           const same = await returned.evaluate((value, identity) => value?.identity === identity, originCard.identity);

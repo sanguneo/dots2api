@@ -70,7 +70,7 @@ export function attachmentsInPage(): Attachment[] {
 }
 
 /** Runs in the browser so authenticated, blob: and data: media share the same bounded download. */
-async function mediaBytesInPage(src: string) {
+export async function mediaBytesInPage(src: string) {
   const limit = 50 * 1024 * 1024;
   const response = await fetch(src, { signal: AbortSignal.timeout(30000) });
   if (!response.ok || !response.body) return { error: `media HTTP ${response.status}` };

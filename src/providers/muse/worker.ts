@@ -60,6 +60,7 @@ async function emitResult(result: RunResult, event: { readonly type: "completed"
     remoteId: result.remoteId,
     pendingTask: result.pendingTask,
     deliveryId: result.deliveryId,
+    followupKeys: result.followupKeys,
     images: (result.images ?? []).map((image) => ({
       mime: image.mime,
       dataB64: Buffer.from(image.data).toString("base64"),
@@ -112,6 +113,7 @@ try {
       if (!adapter.watch) throw workerProtocolError();
       await adapter.watch(input.credentials, {
         ...context, threads: input.threads,
+        onWatchBaseline: (threadId, hashes) => emit({ type: "watch_baseline", threadId, hashes }),
         onWatchApproval: publishApproval,
         onWatchResult: (threadId, result) => {
           pending = pending.then(() => emitResult(result, { type: "watch_result", threadId }));

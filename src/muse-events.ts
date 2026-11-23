@@ -2,6 +2,7 @@ import { jobIdSchema } from "./contracts";
 import { GatewayError } from "./contracts";
 import type { AccountId, Job, MuseWatchContext, RunResult } from "./contracts";
 import type { Gateway } from "./gateway";
+import { followupContentHash, followupMediaHashes, MuseFollowups } from "./muse-followups";
 
 /** Idle browser ownership is released before any foreground account operation acquires the profile. */
 export class MuseEvents {
@@ -10,7 +11,8 @@ export class MuseEvents {
   private timer: ReturnType<typeof setInterval> | undefined;
   private stopped = false;
 
-  constructor(private readonly gateway: Gateway) {}
+  private readonly followups: MuseFollowups;
+  constructor(private readonly gateway: Gateway) { this.followups = new MuseFollowups(gateway.store); }
 
   start(): void {
     if (this.timer) return;
@@ -62,6 +64,7 @@ export class MuseEvents {
         continue;
       }
       if (this.watching.has(account.id)) continue;
+      if (this.followups.pausedUntil(account.id) > Date.now()) continue;
       const abort = new AbortController();
       // Defer execution until the ownership record exists, even when an adapter fails synchronously.
       const done = Promise.resolve().then(async () => {
@@ -77,6 +80,7 @@ export class MuseEvents {
             threadId: job.remoteId ?? "", jobId: job.followup?.originJobId ?? job.id, output: job.output,
           })),
           saveCredentials: repaired => { this.gateway.store.saveAccount(this.gateway.account(account.id), repaired); },
+          onWatchBaseline: (threadId, hashes) => this.followups.baseline(account.id, threadId, hashes),
           onWatchApproval: (threadId, prompt, choose) => {
             const event = this.event(account.id, threadId);
             const withdrawn = Promise.withResolvers<void>();
@@ -144,12 +148,20 @@ export class MuseEvents {
   private result(accountId: AccountId, threadId: string, result: RunResult): void {
     if (result.deliveryId && this.gateway.store.jobs(-1).some(job => job.accountId === accountId &&
       job.remoteId === threadId && job.followup?.deliveryId === result.deliveryId)) return;
+    const contentHash = followupContentHash(result);
+    const claim = this.followups.claim(accountId, threadId, contentHash, result.followupKeys ?? [], Date.now(), followupMediaHashes(result));
+    if (claim === "duplicate") return;
+    if (claim === "paused") {
+      console.warn(`[muse-events] follow-up rate limit; watcher paused account=${accountId} until=${new Date(this.followups.pausedUntil(accountId)).toISOString()}`);
+      this.watching.get(accountId)?.abort.abort();
+      return;
+    }
     const event = this.event(accountId, threadId);
     const images = this.gateway.store.saveImages(event.id, result.images ?? []);
     const files = this.gateway.store.saveFiles(event.id, result.files ?? []);
     this.gateway.store.saveJob({
       ...event, status: "completed", approval: undefined, output: result.text,
-      followup: { originJobId: event.followup?.originJobId ?? null, deliveredAt: null, ...(result.deliveryId ? { deliveryId: result.deliveryId } : {}) },
+      followup: { originJobId: event.followup?.originJobId ?? null, deliveredAt: null, contentHash, ...(result.deliveryId ? { deliveryId: result.deliveryId } : {}) },
       remoteId: result.remoteId ?? threadId, images, files, finishedAt: new Date().toISOString(),
     });
     for (const original of this.gateway.store.jobs(-1)) {
