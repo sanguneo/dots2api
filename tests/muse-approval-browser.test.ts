@@ -9,8 +9,9 @@ import { Gateway } from "../src/gateway";
 import { createMuseAdapter } from "../src/providers/muse";
 import { Store } from "../src/store";
 
-async function browserFixture(mode: "before-send" | "after-send" | "replace" | "reuse" | "sequential", approvalTimeout = 8_000) {
+async function browserFixture(mode: "before-send" | "after-send" | "replace" | "reuse" | "sequential" | "resuming" | "owner-markup" | "replace-opening-menu", approvalTimeout = 8_000) {
   const html = await Bun.file(new URL("./fixtures/muse-approval.html", import.meta.url)).text();
+  const ownerHtml = await Bun.file(new URL("./fixtures/muse-approval-owner.html", import.meta.url)).text();
   const dir = await mkdtemp(join(tmpdir(), "dots2api-approval-browser-"));
   const events: string[] = [];
   const server = Bun.serve({
@@ -20,7 +21,7 @@ async function browserFixture(mode: "before-send" | "after-send" | "replace" | "
       if (url.pathname === "/api/session") return Response.json({ status: "assigned" });
       if (url.pathname === "/thread/new" || url.pathname === "/thread/fixture") {
         events.push(`navigate:${url.pathname}`);
-        return new Response(html.replace("__MODE__", mode), { headers: { "content-type": "text/html" } });
+        return new Response(html.replace("__MODE__", mode).replace("__OWNER_APPROVAL__", ownerHtml), { headers: { "content-type": "text/html" } });
       }
       if (url.pathname === "/event" && request.method === "POST") {
         events.push(await request.text());
@@ -143,9 +144,56 @@ test("a new approval after an answer is published even when its DOM and labels a
     const second = await awaitApproval(fixture, id, first.id);
     expect((await fixture.choose(id, first.id, firstChoice.id)).status).toBe(409);
     const secondChoice = second.choices.find(({ label }) => label === "이번만 허용");
-    if (!secondChoice) throw new Error("Missing second choice");
+    if (!secondChoice) throw new Error(`Missing second choice: ${JSON.stringify(second.choices)}`);
     expect((await fixture.choose(id, second.id, secondChoice.id)).status).toBe(200);
     expect(await fixture.gateway.wait(id)).toMatchObject({ status: "completed", remoteId: "fixture" });
     expect(fixture.events).toEqual(["navigate:/thread/new", "send", "click:once", "click:once"]);
+  } finally { await fixture.close(); }
+});
+
+test("approval removal and resumed Stop do not complete on the pre-approval progress bubble", async () => {
+  const fixture = await browserFixture("resuming");
+  try {
+    const id = await fixture.start();
+    const approval = await awaitApproval(fixture, id);
+    const choice = approval.choices.find(({ label }) => label === "이번만 허용");
+    if (!choice) throw new Error("Missing choice");
+    expect((await fixture.choose(id, approval.id, choice.id)).status).toBe(200);
+    expect(await fixture.gateway.wait(id)).toMatchObject({
+      status: "completed", output: "Completed on the original page.", remoteId: "fixture",
+    });
+    expect(fixture.events).toContain("resume-started");
+    expect(fixture.events).toContain("final");
+  } finally { await fixture.close(); }
+});
+
+test("the owner's real main-composer markup exposes all three exact Korean choices and denies on the same page", async () => {
+  const fixture = await browserFixture("owner-markup");
+  try {
+    const id = await fixture.start();
+    const approval = await awaitApproval(fixture, id);
+    expect(approval.choices.map(choice => choice.label)).toEqual(["이 작업에 대해 허용", "항상 허용", "거부"]);
+    expect(approval.description).toContain("Browser를 사용하여 이 웹사이트 열기");
+    expect(approval.description).toContain("ipmpt.sanguneo.com/");
+    expect(approval.description).toContain("Introduce Eli bot persona");
+    const deny = approval.choices.find(choice => choice.label === "거부");
+    if (!deny) throw new Error("Missing real deny choice");
+    expect((await fixture.choose(id, approval.id, deny.id)).status).toBe(200);
+    expect(await fixture.gateway.wait(id)).toMatchObject({ status: "completed", remoteId: "fixture" });
+    expect(fixture.events).toEqual(["navigate:/thread/new", "send", "click:deny"]);
+  } finally { await fixture.close(); }
+});
+
+test("an approval replaced while its menu opens is not advertised with a partial choice list", async () => {
+  const fixture = await browserFixture("replace-opening-menu");
+  try {
+    const id = await fixture.start();
+    const approval = await awaitApproval(fixture, id);
+    expect(approval.choices.map(choice => choice.label)).toEqual(["거절", "허용", "이번만 허용"]);
+    const once = approval.choices.find(choice => choice.label === "이번만 허용");
+    if (!once) throw new Error("Missing replacement choice");
+    expect((await fixture.choose(id, approval.id, once.id)).status).toBe(200);
+    expect(await fixture.gateway.wait(id)).toMatchObject({ status: "completed", remoteId: "fixture" });
+    expect(fixture.events).toEqual(["navigate:/thread/new", "send", "click:once"]);
   } finally { await fixture.close(); }
 });

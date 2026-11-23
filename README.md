@@ -176,6 +176,7 @@ curl http://127.0.0.1:3010/v1/chat/completions \
 - Every response carries `X-Dots2api-Job-Id`; look the job up with `GET /api/jobs/:id`.
 - For a Muse chat that may need a human decision, pass `Prefer: respond-async`. The gateway returns `202 {job}` after submission; the same conversation and `X-Muse-Thread` rules apply. Poll `GET /api/jobs/:id` for the completed job's `output`, `remoteId`, `images`, and `files`. Image and file indexes use their usual authenticated `/api/jobs/:id/images/:index` and `/api/jobs/:id/files/:index` routes.
 - When a job reports `status: "approval_required"`, its `approval` contains `id`, `description`, `choices` (`id` and `label`), and `expiresAt`. To answer, send authenticated `POST /api/jobs/:id/approvals/:promptId` with `{"choiceId":"..."}`. `200 {"ok":true}` confirms the selected button was clicked on the live Muse page; continue polling for the result. Stale, duplicate, or expired choices return `409`. The gateway never chooses automatically. Unanswered approvals expire within the job's 10-minute approval budget and finish with `errorCode: "approval_timeout"`.
+- Approval answers require `Authorization: Bearer <api-key>`; same-origin browser metadata alone does not authorize a decision.
 
 ### Image generation
 

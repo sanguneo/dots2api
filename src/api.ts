@@ -117,6 +117,9 @@ export function createApi(gateway: Gateway, dotsAuth?: DotsAuth, museLogin?: Mus
     return c.json({ job });
   });
   app.post("/api/jobs/:id/approvals/:promptId", async (c) => {
+    if (!authorized(c.req.header("authorization"), gateway.store.apiKey)) {
+      throw new GatewayError("unauthorized", "API key required.", 401);
+    }
     const id = jobIdSchema.parse(c.req.param("id"));
     const { choiceId } = z.object({ choiceId: approvalChoiceIdSchema }).parse(await c.req.json());
     await gateway.approve(id, c.req.param("promptId"), choiceId);

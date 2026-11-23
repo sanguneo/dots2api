@@ -80,7 +80,7 @@ export class ApprovalWait {
       if (!isNew) return false;
       await this.loadMenu(card);
       const summary = await card.evaluate((value, answered) => {
-        if (!value || (answered && answered.current() && value.root === answered.root && value.description === answered.description &&
+        if (!value || !value.current() || (answered && answered.current() && value.root === answered.root && value.description === answered.description &&
           value.buttons.length === answered.buttons.length &&
           value.buttons.every((button, index) => button === answered.buttons[index] && value.labels[index] === answered.labels[index]))) return null;
         return { description: value.description, labels: value.labels };

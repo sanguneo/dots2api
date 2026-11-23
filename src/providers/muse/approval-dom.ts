@@ -45,12 +45,13 @@ export function scanApprovalCard(rootSelector: string): ApprovalCard | null {
     if (!name || !identity) continue;
     const primary = root.querySelector<HTMLButtonElement>('button[data-hatch-approval-primary-action="true"]');
     if (!primary) continue;
-    // lR renders deny buttons as siblings of the wrapper that owns the primary and menu trigger.
+    // Compact cards have sibling buttons; the owner's Browser card wraps each sibling in div.contents.
     const primaryGroup = primary.parentElement;
     const row = primaryGroup?.parentElement;
     if (!primaryGroup || !row || row === root || !root.contains(row)) continue;
     const buttons = [...row.children].flatMap((child) =>
-      child === primaryGroup ? [primary] : child instanceof HTMLButtonElement ? [child] : [])
+      child === primaryGroup ? [primary] : child instanceof HTMLButtonElement ? [child]
+        : child.matches("div.contents") ? [...child.querySelectorAll<HTMLButtonElement>(':scope > button[data-slot="button"]')] : [])
       .filter((button) => Boolean(button.textContent?.trim()) &&
       !button.matches(":disabled,[aria-disabled=true]") &&
       button.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true }));
@@ -63,7 +64,7 @@ export function scanApprovalCard(rootSelector: string): ApprovalCard | null {
         const node = walker.currentNode;
         const parent = node.parentElement;
         const text = node.textContent?.trim();
-        const excluded = parent?.closest('button,[role="menu"],[aria-hidden="true"]');
+        const excluded = parent?.closest('button,[role="menu"],[aria-hidden="true"],.sr-only');
         if (text && parent && !(excluded && excluded !== root && root.contains(excluded)) &&
           parent.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true })) parts.push(text);
       }

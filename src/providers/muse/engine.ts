@@ -9,6 +9,7 @@ import { IMAGE_EXTENSIONS, MAX_IMAGES } from "../../images";
 import { attachmentsInPage, downloadFiles, FILE_CARD, generatedMedia } from "./media";
 import { ApprovalWait } from "./approval-wait";
 import { APPROVAL_CARD_SELECTOR, scanApprovalCard } from "./approval-dom";
+import { observeCompletion } from "./completion";
 export { fileBlock } from "./media";
 
 const configuration = z.object({
@@ -362,27 +363,7 @@ export function createMuseAdapter(site = "https://muse.ai", chatTimeout = CHAT_T
         const baselineAttachments = await page.locator('[data-testid^="hatch-chat-attachment-presentation-"]').count();
         const baselineFiles = await page.locator(FILE_CARD).count();
         // Observe the actual Stop control transition, not text stability or a silent timeout.
-        await page.evaluate(({ knownAttachments, approvalSelector }) => {
-          let seenStop = false;
-          const root = document.documentElement;
-          const stopSelector = '[data-testid="hatch-composer-stop-button"], button[aria-label*="Stop" i], button[aria-label*="\u{505c}\u{6b62}"]';
-          const bubbleSelector = 'div[class*="hatch-agent-bubble-bg"]';
-          const previous = new Map([...document.querySelectorAll(bubbleSelector)].map((bubble) => [bubble, bubble.textContent]));
-          const observe = () => {
-            // Skip the side panel's "Stop task" buttons: a running background task must not hide the reply's own Stop transition.
-            const stop = [...document.querySelectorAll(stopSelector)].find((el) => !/task|\u{4efb}\u{52a1}/iu.test(el.getAttribute("aria-label") ?? "")) ?? null;
-            if (stop) seenStop = true;
-            if (root.dataset["museComplete"] === "true" || !seenStop || stop) return;
-            // Muse can replace Stop with an approval card. This is not a completed reply.
-            if ([...document.querySelectorAll(approvalSelector)].some((card) => card.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true }))) return;
-            if (!document.querySelector('div[class*="chat-user-bubble"]')) return;
-            const hasText = [...document.querySelectorAll(bubbleSelector)].some((bubble) => bubble.textContent?.trim() && bubble.textContent !== previous.get(bubble));
-            const hasMedia = document.querySelectorAll('[data-testid^="hatch-chat-attachment-presentation-"]').length > knownAttachments;
-            if (hasText || hasMedia) root.dataset["museComplete"] = "true";
-          };
-          new MutationObserver(observe).observe(document.body, { childList: true, subtree: true, attributes: true, characterData: true });
-          observe();
-        }, { knownAttachments: baselineAttachments, approvalSelector: APPROVAL_CARD_SELECTOR });
+        await page.evaluate(observeCompletion, { knownAttachments: baselineAttachments, approvalSelector: APPROVAL_CARD_SELECTOR });
         await input.fill(prompt);
         // The composer itself has role=button and can inherit "Send" in its
         // accessible name. Only click the actual, explicitly labelled control.

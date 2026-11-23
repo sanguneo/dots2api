@@ -78,6 +78,9 @@ test("async chat exposes approvals on the keyed job and acknowledges only once t
     });
     expect(gateway.account(account.id).busy).toBe(true);
     expect((await request(answer, "once", { "content-type": "application/json" })).status).toBe(401);
+    expect((await request(answer, "unlisted", {
+      "content-type": "application/json", "sec-fetch-site": "same-origin",
+    })).status).toBe(401);
     expect((await request(`${url}/approvals/old`, "once")).status).toBe(409);
     expect((await request(answer, "unlisted")).status).toBe(409);
     let acknowledged = false;

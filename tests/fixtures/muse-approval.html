@@ -1,7 +1,8 @@
 <!doctype html>
 <html lang="ko">
-<head><meta charset="utf-8"></head>
+<head><meta charset="utf-8"><style>.contents { display: contents; }</style></head>
 <body>
+  <template id="owner-approval">__OWNER_APPROVAL__</template>
   <textarea></textarea>
   <button aria-label="Send" disabled>Send</button>
   <main role="log"></main>
@@ -36,7 +37,11 @@
 
     function showCard() {
       document.querySelector('#allow-menu')?.remove();
-      deck.innerHTML = `
+      if (mode === "owner-markup") {
+        deck.replaceChildren(document.querySelector("#owner-approval").content.cloneNode(true));
+        const controls = deck.querySelectorAll("button[data-slot=button]");
+        ["allow", "always", "deny"].forEach((id, index) => { controls[index].id = id; });
+      } else deck.innerHTML = `
         <div role="group" aria-label="Publish the fixture website"
           data-testid="hatch-inline-approval-card" data-hatch-single-approval="true"
           data-hatch-inline-approval-shortcut-surface="true" data-hatch-approval-surface="chat">
@@ -62,14 +67,28 @@
           document.querySelector('#allow-menu')?.remove();
           deck.replaceChildren();
           send.disabled = !input.value;
+          if (mode === "resuming") {
+            for (let frame = 0; frame < 4; frame++) await new Promise(requestAnimationFrame);
+            log.insertAdjacentHTML("beforeend", '<button aria-label="Stop">Stop</button>');
+            await event("resume-started");
+            for (let frame = 0; frame < 4; frame++) await new Promise(requestAnimationFrame);
+            complete();
+            await event("final");
+            return;
+          }
           if (hasSent) complete();
         };
       }
-      deck.querySelectorAll("#deny,#allow").forEach(choose);
-      deck.querySelector("#detail").onclick = () => event("click:details");
+      deck.querySelectorAll("#deny,#allow,#always").forEach(choose);
+      const detail = deck.querySelector("#detail");
+      if (detail) detail.onclick = () => event("click:details");
       const more = deck.querySelector("#more");
-      more.addEventListener("pointerdown", (e) => {
+      more?.addEventListener("pointerdown", (e) => {
         e.preventDefault();
+        if (mode === "replace-opening-menu" && serial === 1) {
+          const card = deck.querySelector('[data-testid="hatch-inline-approval-card"]');
+          card["__reactProps$fixture"] = { children: { props: { approval: { approvalId: "fixture-" + (++serial) } } } };
+        }
         more.setAttribute("aria-expanded", "true");
         more.setAttribute("aria-controls", "allow-menu");
         document.body.insertAdjacentHTML("beforeend", `
@@ -79,7 +98,7 @@
           </div>`);
         document.querySelectorAll("#once,#disabled").forEach(choose);
       });
-      const card = deck.firstElementChild;
+      const card = deck.querySelector('[data-testid="hatch-inline-approval-card"]');
       card["__reactProps$fixture"] = { children: { props: { approval: { approvalId: "fixture-" + (++serial) } } } };
       send.disabled = true;
     }
@@ -91,7 +110,13 @@
       history.replaceState(null, "", "/thread/fixture");
       await event("send");
       if (mode === "before-send") complete();
-      else showCard();
+      else {
+        if (mode === "resuming") {
+          log.insertAdjacentHTML("beforeend", '<div class="hatch-agent-bubble-bg">Preparing, approval needed.</div>');
+          document.querySelector('[aria-label="Stop"]').remove();
+        }
+        showCard();
+      }
     });
     if (mode === "before-send") {
       history.replaceState(null, "", "/thread/fixture");
