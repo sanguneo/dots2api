@@ -81,6 +81,12 @@ export interface Job {
   readonly error: string | null;
   readonly errorCode?: string | undefined;
   readonly approval?: JobApproval | undefined;
+  readonly followup?: {
+    readonly originJobId: JobId | null;
+    readonly deliveredAt: string | null;
+    readonly deliveryId?: string | undefined;
+  } | undefined;
+  readonly pendingTask?: boolean | undefined;
   readonly remoteId: string | null;
   readonly images: readonly JobImage[];
   readonly files?: readonly JobFile[];
@@ -123,6 +129,8 @@ export interface RunResult {
   readonly remoteId: string | null;
   readonly images?: readonly RunImage[];
   readonly files?: readonly RunFile[];
+  readonly pendingTask?: boolean;
+  readonly deliveryId?: string;
 }
 export interface AdapterContext {
   readonly accountId: AccountId;
@@ -145,6 +153,16 @@ export interface AdapterContext {
   /** Present when the caller can persist credentials an adapter repaired (for example a rebound thread). */
   readonly saveCredentials?: (credentials: Credentials) => void;
 }
+export interface MuseWatchThread {
+  readonly threadId: string;
+  readonly jobId: JobId;
+  readonly output: string;
+}
+export interface MuseWatchContext extends AdapterContext {
+  readonly threads: readonly MuseWatchThread[];
+  readonly onWatchApproval: (threadId: string | null, approval: JobApproval, choose: (choiceId: string) => Promise<boolean>) => () => void;
+  readonly onWatchResult: (threadId: string, result: RunResult) => void;
+}
 /** "gone": the side chat no longer exists remotely. "failed": nothing is known to have been deleted; try again later. */
 export type ThreadDeletion = "deleted" | "gone" | "failed";
 export interface ProviderAdapter {
@@ -154,6 +172,8 @@ export interface ProviderAdapter {
   check(credentials: Credentials, context: AdapterContext): Promise<CheckResult>;
   /** Never retry an accepted remote submission blindly. Timeout must be reported as uncertain. */
   run(credentials: Credentials, prompt: string, context: AdapterContext): Promise<RunResult>;
+  /** Observe remote work while the account is idle; cancellation releases its single browser before another operation. */
+  watch?(credentials: Credentials, context: MuseWatchContext): Promise<void>;
   /**
    * Optional automatic recovery, used after an uncertain failure. It re-establishes the remote session - the step a
    * human performs by pressing Check - and must never submit work or touch an in-flight remote job. Declaring it lets

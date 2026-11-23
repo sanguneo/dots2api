@@ -8,7 +8,7 @@ export function scanApprovalCard(rootSelector: string): ApprovalCard | null {
   // The shared deck can reuse identical DOM nodes for a new request. The card root's committed
   // host props hold the single/group child React element with `approval` / `approvals` props.
   // Never read an in-progress alternate Fiber or send these provider IDs outside the page.
-  const approvalIdentity = (root: HTMLElement): string | null => {
+  const approvalDetails = (root: HTMLElement): { identity: string; threadId: string | null } | null => {
     const key = Object.keys(root).find((name) => name.startsWith("__reactProps$"));
     if (!key) return null;
     const props: unknown = Object.getOwnPropertyDescriptor(root, key)?.value;
@@ -29,7 +29,28 @@ export function scanApprovalCard(rootSelector: string): ApprovalCard | null {
             if (request && typeof request === "object" && "approvalId" in request &&
                 typeof request.approvalId === "string" && request.approvalId.length > 0 && request.approvalId.length <= 256) ids.push(request.approvalId);
           }
-          if (ids.length === requests.length) return JSON.stringify(ids);
+          if (ids.length === requests.length) {
+            const linkedThread = (anchor: HTMLAnchorElement) => {
+              const url = new URL(anchor.href, location.href);
+              const id = url.origin === location.origin && /^\/thread\/([A-Za-z0-9_-]{1,128})\/?$/.exec(url.pathname)?.[1];
+              return id && id !== "new" ? [id] : [];
+            };
+            const links = [...root.querySelectorAll<HTMLAnchorElement>("a[href]")].flatMap(linkedThread);
+            // The observed Korean and English cards name the source chat in their
+            // native details. Only resolve that title through an actual sidebar link.
+            const cleanTitle = (value: string) => value.replace(/[\u2066-\u2069]/g, "").trim();
+            const description = cleanTitle(root.textContent ?? "");
+            const title = /이 작업은 ['‘](.+?)['’] 사이드 채팅에서 비롯되었습니다|This task comes from the side chat [“"](.+?)[”"]/u.exec(description);
+            const source = title?.[1] ?? title?.[2];
+            const rows = source ? [...document.querySelectorAll<HTMLElement>('[data-testid="hatch-thread-row"]')].filter((row) =>
+              row.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true }) &&
+              [row.getAttribute("data-title"), row.getAttribute("title"), row.getAttribute("aria-label"), row.textContent]
+                .some((value) => value !== null && cleanTitle(value) === source)) : [];
+            const row = rows.length === 1 ? rows[0] : undefined;
+            const rowLinks = row instanceof HTMLAnchorElement ? [row] : [...(row?.querySelectorAll<HTMLAnchorElement>("a[href]") ?? [])];
+            const candidates = [...new Set([...links, ...rowLinks.flatMap(linkedThread)])];
+            return { identity: JSON.stringify(ids), threadId: candidates.length === 1 ? candidates[0] ?? null : null };
+          }
         }
         if ("children" in child) pending.push(child.children);
       }
@@ -41,8 +62,8 @@ export function scanApprovalCard(rootSelector: string): ApprovalCard | null {
     const surface = root.dataset["hatchApprovalSurface"];
     if ((surface !== "chat" && surface !== "panel") || !root.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true })) continue;
     const name = root.getAttribute("aria-label")?.trim();
-    const identity = approvalIdentity(root);
-    if (!name || !identity) continue;
+    const approval = approvalDetails(root);
+    if (!name || !approval) continue;
     const primary = root.querySelector<HTMLButtonElement>('button[data-hatch-approval-primary-action="true"]');
     if (!primary) continue;
     // Compact cards have sibling buttons; the owner's Browser card wraps each sibling in div.contents.
@@ -75,8 +96,8 @@ export function scanApprovalCard(rootSelector: string): ApprovalCard | null {
     const labels = buttons.map((button) => button.textContent?.trim() ?? "");
     if (labels.some((label) => !label || label.length > 120)) continue;
     return {
-      root, description, buttons, labels, more,
-      current: () => root.isConnected && approvalIdentity(root) === identity &&
+      root, ...approval, description, buttons, labels, more,
+      current: () => root.isConnected && approvalDetails(root)?.identity === approval.identity &&
         root.getAttribute("aria-label")?.trim() === name && details() === body,
     };
   }

@@ -39,6 +39,8 @@ const jobSchema = z.object({
   error: z.string().nullable(),
   errorCode: z.string().optional(),
   approval: jobApprovalSchema.optional(),
+  followup: z.object({ originJobId: jobIdSchema.nullable(), deliveredAt: z.string().nullable(), deliveryId: z.string().optional() }).optional(),
+  pendingTask: z.boolean().optional(),
   remoteId: z.string().nullable(),
   images: z.array(z.object({
     mime: z.enum(IMAGE_MIMES), bytes: z.number().int().nonnegative(),
@@ -218,8 +220,8 @@ export class Store {
   deleteMuseThread(thread: MuseThread): void {
     this.threads.remove(thread);
   }
-  jobs(): Job[] {
-    return this.db.query<Row, []>("SELECT body FROM jobs ORDER BY rowid DESC LIMIT 200").all()
+  jobs(limit = 200): Job[] {
+    return this.db.query<Row, [number]>("SELECT body FROM jobs ORDER BY rowid DESC LIMIT ?").all(limit)
       .map((row) => jobSchema.parse(JSON.parse(row.body)));
   }
   /** The operator's per-provider switch; a disabled provider accepts no new jobs. Default: every provider enabled. */
@@ -256,6 +258,7 @@ export class Store {
   pruneJobs(cutoff: string): number {
     const old = this.db.query<{ id: string }, [string]>(`
       SELECT id FROM jobs WHERE json_extract(body, '$.status') NOT IN ('queued', 'running', 'approval_required')
+        AND COALESCE(json_extract(body, '$.pendingTask'), 0) = 0
         AND COALESCE(json_extract(body, '$.finishedAt'), json_extract(body, '$.createdAt')) < ?
     `).all(cutoff);
     const remove = this.db.query("DELETE FROM jobs WHERE id=?");

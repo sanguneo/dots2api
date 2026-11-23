@@ -6,10 +6,11 @@ import { z } from "zod";
 import { GatewayError, MUSE_APPROVAL_TIMEOUT_MS } from "../../contracts";
 import type { AdapterContext, Credentials, ProviderAdapter, ReferenceImage, RunResult, ThreadDeletion } from "../../contracts";
 import { IMAGE_EXTENSIONS, MAX_IMAGES } from "../../images";
-import { attachmentsInPage, downloadFiles, FILE_CARD, generatedMedia } from "./media";
+import { downloadFiles, FILE_CARD, generatedMedia, mediaBaseline } from "./media";
 import { ApprovalWait } from "./approval-wait";
 import { APPROVAL_CARD_SELECTOR, scanApprovalCard } from "./approval-dom";
-import { observeCompletion } from "./completion";
+import { hasPendingMuseTask, observeCompletion } from "./completion";
+import { rememberMuseTranscript, watchMusePage } from "./watch";
 export { fileBlock } from "./media";
 
 const configuration = z.object({
@@ -291,6 +292,16 @@ export function createMuseAdapter(site = "https://muse.ai", chatTimeout = CHAT_T
         await browser.close();
       }
     },
+    async watch(credentials, context) {
+      const config = this.validate(credentials);
+      const browser = await openBrowser({ ...config, login: "false" }, context, origin);
+      try {
+        const page = browser.pages()[0] ?? await browser.newPage();
+        await watchMusePage(page, origin, context, resolve(context.dataDir, "muse", context.accountId, "watch-state.json"), approvalTimeout);
+      } finally {
+        await browser.close();
+      }
+    },
     /**
      * Deletes one side chat by id through the same single-row path a finished job uses. "gone" only when Muse itself sends
      * the page home; a page that is not the thread for any other reason is a failure to retry, never a deletion.
@@ -359,9 +370,14 @@ export function createMuseAdapter(site = "https://muse.ai", chatTimeout = CHAT_T
         // An upload cannot outlast the chat it belongs to, which also keeps the bounded test adapters fast.
         if (references.length) await attachReferences(page, references, Math.min(REFERENCE_UPLOAD_TIMEOUT, chatTimeout));
         // A generated image must be new, not a history attachment or the user's own upload.
-        const baseline = new Set((await page.evaluate(attachmentsInPage)).map((attachment) => attachment.src));
-        const baselineAttachments = await page.locator('[data-testid^="hatch-chat-attachment-presentation-"]').count();
+        const baseline = await mediaBaseline(page);
+        const baselineAttachments = baseline.cards;
         const baselineFiles = await page.locator(FILE_CARD).count();
+        const existingThread = /^\/thread\/([^/]+)\/?$/.exec(new URL(page.url()).pathname)?.[1];
+        const statePath = resolve(context.dataDir, "muse", context.accountId, "watch-state.json");
+        if (existingThread && existingThread !== "new") {
+          for (const hash of await rememberMuseTranscript(page, statePath, existingThread)) baseline.hashes.add(hash);
+        }
         // Observe the actual Stop control transition, not text stability or a silent timeout.
         await page.evaluate(observeCompletion, { knownAttachments: baselineAttachments, approvalSelector: APPROVAL_CARD_SELECTOR });
         await input.fill(prompt);
@@ -399,15 +415,20 @@ export function createMuseAdapter(site = "https://muse.ai", chatTimeout = CHAT_T
             finishBy += Date.now() - tick;
             continue;
           }
-          if (await page.evaluate(() => document.documentElement.dataset["museComplete"] === "true")) break;
-          if (Date.now() >= finishBy) throw new errors.TimeoutError("Muse generation completion timed out.");
-          await sleep(Math.min(125, finishBy - Date.now()));
-        }
-        const media = await generatedMedia(page, { sources: baseline, cards: baselineAttachments });
+          if (!await page.evaluate(() => document.documentElement.dataset["museComplete"] === "true")) {
+            if (Date.now() >= finishBy) throw new errors.TimeoutError("Muse generation completion timed out.");
+            await sleep(Math.min(125, finishBy - Date.now()));
+            continue;
+          }
+        const media = await generatedMedia(page, baseline);
         const images = media.images;
         // An image-only answer has no agent text bubble, and waiting for one timed out after the image had arrived.
         const bubbles = page.locator('div[class*="hatch-agent-bubble-bg"]');
-        const rawText = await bubbles.count() ? await bubbles.last().innerText({ timeout: 5_000 }) : "";
+        const message = await bubbles.count() ? await bubbles.last().evaluate((element: HTMLElement) => ({
+          id: element.closest("[data-message-id]")?.getAttribute("data-message-id") ?? "",
+          text: element.innerText.trim(),
+        })) : null;
+        const rawText = message?.text ?? "";
         // innerText drops link targets (source chips are links outside the bubble), so list the ones the text lacks.
         const sources = [...new Set((await page.evaluate(sourceLinksInPage)).map(resolveSourceUrl))]
           .filter((url): url is string => url !== null && !rawText.includes(url));
@@ -416,15 +437,38 @@ export function createMuseAdapter(site = "https://muse.ai", chatTimeout = CHAT_T
         const downloaded = await downloadFiles(page, baselineFiles, 3 - media.files.length);
         const files = [...media.files, ...downloaded.files].slice(0, 3);
         const text = [body, ...sources.map((url) => `출처: ${url}`), ...media.notes, ...downloaded.blocks].filter(Boolean).join("\n\n");
-        if (!text.trim() && images.length === 0 && files.length === 0) throw new GatewayError("muse_result", "Muse finished without text or media.", 502, true);
+        // Media and file extraction can take seconds. Do not commit the candidate if a late
+        // approval or resumed generation invalidated the Stop transition during extraction.
+        const candidateAt = Date.now();
+        if (await approvals.check()) {
+          finishBy += Date.now() - candidateAt;
+          continue;
+        }
+        if (!await page.evaluate(() => document.documentElement.dataset["museComplete"] === "true")) continue;
+        if (!text.trim() && images.length === 0 && files.length === 0) {
+          if (Date.now() >= finishBy) throw new GatewayError("muse_result", "Muse finished without text or media.", 502, true);
+          await sleep(Math.min(125, finishBy - Date.now()));
+          continue;
+        }
         const match = /^\/thread\/([^/]+)\/?$/.exec(new URL(page.url()).pathname);
-        if (pruneThreads) await pruneCurrentThread(page);
+        const pendingTask = await page.evaluate(hasPendingMuseTask);
+        const remoteId = match?.[1] && match[1] !== "new" ? match[1] : null;
+        const pruned = pruneThreads && !pendingTask && await pruneCurrentThread(page);
+        if (remoteId && !pruned) {
+          await rememberMuseTranscript(page, statePath, remoteId, {
+            message, sources: media.sources, files: downloaded.ids,
+            historicalPresentations: baseline.presentations, historicalMessages: baseline.messages,
+          })
+            .catch(() => undefined); // A checkpoint failure must not turn a confirmed reply into a retry.
+        }
         return {
           text: text.trim(),
-          remoteId: match?.[1] && match[1] !== "new" ? match[1] : null,
+          remoteId,
+          ...(pendingTask ? { pendingTask } : {}),
           ...(images.length ? { images } : {}),
           ...(files.length ? { files } : {}),
         };
+        }
       } catch (error) {
         if (error instanceof GatewayError) {
           if (!submitted || error.uncertain || error.code === "approval_timeout") throw error;

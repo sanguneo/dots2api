@@ -95,6 +95,19 @@ export function createApi(gateway: Gateway, dotsAuth?: DotsAuth, museLogin?: Mus
   });
   app.post("/api/accounts/:id/check", async (c) => c.json({ account: await gateway.check(accountIdSchema.parse(c.req.param("id"))) }));
   app.get("/api/jobs", (c) => c.json({ jobs: gateway.store.jobs() }));
+  app.use("/api/muse-events*", async (c, next) => {
+    if (!authorized(c.req.header("authorization"), gateway.store.apiKey)) {
+      throw new GatewayError("unauthorized", "API key required.", 401);
+    }
+    await next();
+  });
+  app.get("/api/muse-events", (c) => c.json({ events: gateway.museEvents.pending() }));
+  app.post("/api/muse-events/:id/ack", (c) => {
+    if (!gateway.museEvents.acknowledge(jobIdSchema.parse(c.req.param("id")))) {
+      throw new GatewayError("event_conflict", "That event is not ready for delivery acknowledgment.", 409);
+    }
+    return c.json({ ok: true });
+  });
   app.delete("/api/muse-threads/:key", async (c) => {
     const key = parseThreadKey(c.req.param("key"), undefined);
     // Route parameters are always present; parsing applies the same contract as creation.

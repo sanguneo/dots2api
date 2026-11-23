@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { approvalPromptIdSchema, GatewayError, jobApprovalSchema, MAX_FILE_BYTES, MAX_FILES, MUSE_APPROVAL_TIMEOUT_MS } from "../contracts";
-import type { AdapterContext, CheckResult, Credentials, ProviderAdapter, RunFile, RunImage, RunResult, ThreadDeletion } from "../contracts";
+import type { AdapterContext, CheckResult, Credentials, MuseWatchContext, ProviderAdapter, RunFile, RunImage, RunResult, ThreadDeletion } from "../contracts";
 import { createMuseAdapter as createBrowserAdapter, sanitizeDiagnostics } from "./muse/engine";
 import { approvalResultSchema, EVENT_LIMIT, jsonLines, readStream, REQUEST_LIMIT, workerProtocolError } from "./muse/ipc";
 import type { ApprovalCommand } from "./muse/ipc";
@@ -39,23 +39,46 @@ const imageSchema = z.object({
   height: z.number().int().positive().optional(),
   revisedPrompt: z.string().optional(),
 });
+const resultFields = {
+  text: z.string(), remoteId: z.string().nullable(), images: z.array(imageSchema).default([]), pendingTask: z.boolean().optional(),
+  deliveryId: z.string().max(128).optional(),
+};
 const eventSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("submitted") }),
   z.object({ type: z.literal("accepted"), remoteId: z.string().nullable() }),
   z.object({ type: z.literal("credentials"), credentials: z.record(z.string(), z.string()) }),
-  z.object({ type: z.literal("approval"), prompt: jobApprovalSchema }),
+  z.object({ type: z.literal("approval"), threadId: z.string().nullable(), prompt: jobApprovalSchema }),
   z.object({ type: z.literal("approval_withdrawn"), promptId: approvalPromptIdSchema }),
   approvalResultSchema,
   z.object({ type: z.literal("checked"), detail: z.string() }),
   z.object({ type: z.literal("deleted"), outcome: z.enum(["deleted", "gone", "failed"]) }),
   z.object({ type: z.literal("file"), name: z.string(), mime: z.string(), dataB64: z.string().max(Math.ceil(MAX_FILE_BYTES / 3) * 4) }),
-  z.object({ type: z.literal("completed"), text: z.string(), remoteId: z.string().nullable(), images: z.array(imageSchema).default([]) }),
+  z.object({ type: z.literal("completed"), ...resultFields }),
+  z.object({ type: z.literal("watch_result"), threadId: z.string(), ...resultFields }),
+  z.object({ type: z.literal("watched") }),
   z.object({ type: z.literal("failed"), code: z.string(), message: z.string(), status: z.number(), uncertain: z.boolean() }),
 ]);
 type WorkerEvent = z.infer<typeof eventSchema>;
-type Terminal = Extract<WorkerEvent, { type: "checked" | "deleted" | "completed" | "failed" }>;
+type Terminal = Extract<WorkerEvent, { type: "checked" | "deleted" | "completed" | "failed" | "watched" }>;
 type WorkerReply = Exclude<Terminal, { type: "failed" } | { type: "completed" }>
   | (Extract<Terminal, { type: "completed" }> & { readonly files: readonly RunFile[] });
+
+function runResult(result: z.infer<z.ZodObject<typeof resultFields>>, files: readonly RunFile[]): RunResult {
+  const images: RunImage[] = result.images.map((image) => ({
+    mime: image.mime,
+    data: Buffer.from(image.dataB64, "base64"),
+    ...(image.width !== undefined ? { width: image.width } : {}),
+    ...(image.height !== undefined ? { height: image.height } : {}),
+    ...(image.revisedPrompt !== undefined ? { revisedPrompt: image.revisedPrompt } : {}),
+  }));
+  return {
+    text: result.text, remoteId: result.remoteId,
+    ...(result.pendingTask ? { pendingTask: true } : {}),
+    ...(result.deliveryId ? { deliveryId: result.deliveryId } : {}),
+    ...(images.length ? { images } : {}),
+    ...(files.length ? { files } : {}),
+  };
+}
 
 // Compile our TypeScript worker once; the browser's officially supported Node
 // runtime owns all Playwright subprocesses. Credentials travel over stdin only.
@@ -98,17 +121,18 @@ interface WorkerSettings {
 }
 
 async function callWorker(
-  operation: "check" | "run" | "delete",
+  operation: "check" | "run" | "delete" | "watch",
   settings: WorkerSettings,
   credentials: Credentials,
   prompt: string,
   context: AdapterContext,
+  watch?: MuseWatchContext,
 ): Promise<WorkerReply> {
   const node = nodeBinary();
   const source = await workerProgram();
   if (context.signal.aborted) throw new GatewayError("muse_cancelled", "Muse operation cancelled.", 409);
   const request = JSON.stringify({
-    operation, ...settings, credentials, prompt, accountId: context.accountId, dataDir: context.dataDir, threadId: context.threadId ?? null,
+    operation, ...settings, credentials, prompt, accountId: context.accountId, dataDir: context.dataDir, threadId: context.threadId ?? null, threads: watch?.threads,
     referenceImages: (context.referenceImages ?? []).map((image) => ({ mime: image.mime, dataB64: Buffer.from(image.data).toString("base64") })),
   });
   if (Buffer.byteLength(request) > REQUEST_LIMIT) throw new GatewayError("muse_prompt", "Muse worker request is too large.", 413);
@@ -121,7 +145,9 @@ async function callWorker(
   const abort = () => {
     if (killTimer || child.exitCode !== null) return;
     child.kill("SIGTERM");
-    killTimer = setTimeout(() => child.kill("SIGKILL"), 5_000);
+    // A watch can be preempted while Chromium is still launching. Give the
+    // worker time to acquire and then close the context before forced exit.
+    killTimer = setTimeout(() => child.kill("SIGKILL"), operation === "watch" ? 30_000 : 5_000);
   };
   context.signal.addEventListener("abort", abort, { once: true });
   if (context.signal.aborted) abort();
@@ -153,7 +179,7 @@ async function callWorker(
   try {
     child.stdin.write(`${request}\n`);
     // A large reference request may still be draining here; stdout is read concurrently.
-    const sent = Promise.resolve(operation === "run" ? child.stdin.flush() : child.stdin.end())
+    const sent = Promise.resolve(operation === "run" || operation === "watch" ? child.stdin.flush() : child.stdin.end())
       .catch(() => abort());
     for await (const line of jsonLines(readStream(child.stdout), EVENT_LIMIT)) {
         if (terminal) throw workerProtocolError();
@@ -163,9 +189,9 @@ async function callWorker(
           case "accepted": context.onAccepted?.(event.remoteId); break;
           case "credentials": context.saveCredentials?.(event.credentials); break;
           case "approval": {
-            if (operation !== "run" || active) throw workerProtocolError();
+            if ((operation !== "run" && operation !== "watch") || active) throw workerProtocolError();
             const { prompt } = event;
-            const remove = context.onApproval?.(prompt, async (choiceId) => {
+            const choose = async (choiceId: string) => {
               if (context.signal.aborted || active?.id !== prompt.id || awaiting) return false;
               const command: ApprovalCommand = { type: "choose", promptId: prompt.id, choiceId };
               const answer = Promise.withResolvers<boolean>();
@@ -180,7 +206,9 @@ async function callWorker(
               // The browser owns the deadline and exact click; this only bounds a lost worker acknowledgement.
               const timer = setTimeout(() => { settle(false); abort(); }, 5_000);
               try { return await answer.promise; } finally { clearTimeout(timer); }
-            });
+            };
+            active = { id: prompt.id, withdraw: () => undefined };
+            const remove = watch ? watch.onWatchApproval(event.threadId, prompt, choose) : context.onApproval?.(prompt, choose);
             active = { id: prompt.id, withdraw: remove ?? (() => undefined) };
             break;
           }
@@ -203,10 +231,16 @@ async function callWorker(
           case "checked":
           case "deleted":
           case "completed":
+          case "watched":
           case "failed":
             settle(false);
             withdraw();
             terminal = event;
+            break;
+          case "watch_result":
+            if (!watch) throw workerProtocolError();
+            // A verified frame already produced by the browser must survive account preemption.
+            watch.onWatchResult(event.threadId, runResult(event, files.splice(0)));
             break;
         }
     }
@@ -218,7 +252,7 @@ async function callWorker(
       outcome = `${terminal.code}: ${terminal.message}`;
       throw new GatewayError(terminal.code, terminal.message, terminal.status, terminal.uncertain);
     }
-    outcome = terminal.type === "completed" ? "completed" : "checked";
+    outcome = terminal.type === "completed" || terminal.type === "watched" ? "completed" : "checked";
     return terminal.type === "completed" ? { ...terminal, files } : terminal;
   } catch (error) {
     if (error instanceof GatewayError) throw error;
@@ -258,23 +292,22 @@ export function createMuseAdapter(site = "https://muse.ai", chatTimeout = 600_00
   const runOnce = async (credentials: Credentials, prompt: string, context: AdapterContext): Promise<RunResult> => {
     const result = await callWorker("run", runSettings(context), credentials, prompt, context);
     if (result.type !== "completed") throw new GatewayError("muse_worker", "Unexpected Muse job result.", 502, true);
-    const images: RunImage[] = result.images.map((image) => ({
-      mime: image.mime,
-      data: new Uint8Array(Buffer.from(image.dataB64, "base64")),
-      ...(image.width !== undefined ? { width: image.width } : {}),
-      ...(image.height !== undefined ? { height: image.height } : {}),
-      ...(image.revisedPrompt !== undefined ? { revisedPrompt: image.revisedPrompt } : {}),
-    }));
-    return {
-      text: result.text, remoteId: result.remoteId,
-      ...(images.length ? { images } : {}),
-      ...(result.files.length ? { files: result.files } : {}),
-    };
+    return runResult(result, result.files);
   };
   return {
     info: definition.info,
     validate: definition.validate,
     check: reconnect,
+    async watch(credentials, context) {
+      if (context.signal.aborted) return;
+      definition.validate(credentials);
+      try {
+        const result = await callWorker("watch", settings, credentials, "", context, context);
+        if (result.type !== "watched") throw workerProtocolError();
+      } catch (error) {
+        if (!context.signal.aborted) throw error;
+      }
+    },
     /**
      * Recovery around a failed attempt. Each attempt is a new worker process, a new browser and a new thread, so a dead
      * browser or a lapsed session is exactly what a second attempt needs. The session is re-verified first, and only a
