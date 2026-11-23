@@ -1,4 +1,5 @@
 import type { Page } from "playwright";
+import { getMimeType } from "hono/utils/mime";
 import { MAX_FILE_BYTES, MAX_FILES } from "../../contracts";
 import type { RunFile, RunImage } from "../../contracts";
 import { MAX_IMAGES } from "../../images";
@@ -160,7 +161,7 @@ export async function downloadFiles(page: Page, knownCards: number, limit = MAX_
           blocks.push(fileBlock(name, data));
         } else {
           const extension = name.split(".").pop()?.toLowerCase();
-          const mime = extension === "mp4" ? "video/mp4" : extension === "webm" ? "video/webm" : extension === "mov" ? "video/quicktime" : "application/octet-stream";
+          const mime = getMimeType(name)?.split(";")[0] ?? (extension === "mov" ? "video/quicktime" : "application/octet-stream");
           files.push({ name, mime, data });
         }
       }
