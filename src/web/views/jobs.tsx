@@ -15,7 +15,7 @@ import { JobDrawer } from "./job-drawer";
 type TargetMode = "provider" | "account";
 type StatusFilter = JobStatus | "all";
 
-const STATUS_ORDER: readonly JobStatus[] = ["queued", "running", "completed", "failed", "unknown"];
+const STATUS_ORDER: readonly JobStatus[] = ["queued", "running", "approval_required", "completed", "failed", "unknown"];
 
 function JobComposer() {
   const { providers, accounts } = useGateway();

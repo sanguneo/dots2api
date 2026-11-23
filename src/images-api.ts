@@ -1,7 +1,7 @@
 import type { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { z } from "zod";
-import { GatewayError } from "./contracts";
+import { GatewayError, jobResultError } from "./contracts";
 import type { Job, ProviderId, ReferenceImage } from "./contracts";
 import type { Gateway } from "./gateway";
 import { buildImagePrompt } from "./image-prompt";
@@ -96,7 +96,7 @@ export function attachImageGeneration(app: Hono, gateway: Gateway): void {
       jobIds.push(job.id);
       const result = await gateway.wait(job.id);
       if (result.status !== "completed") {
-        failure = new GatewayError("upstream_unconfirmed", result.error ?? "Remote result is not confirmed.", 502, result.status === "unknown");
+        failure = jobResultError(result);
         break;
       }
       const image = result.images[0];

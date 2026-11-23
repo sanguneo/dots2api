@@ -86,7 +86,7 @@ export function App() {
   );
 
   const accountCount = accounts.data?.length ?? null;
-  const running = jobs.data?.filter((job) => job.status === "running").length ?? 0;
+  const running = jobs.data?.filter((job) => job.status === "running" || job.status === "approval_required").length ?? 0;
   const unauthorized = [providers.error, accounts.error, jobs.error].some((error) => error?.unauthorized === true);
 
   function skipToMain(): void {

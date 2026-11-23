@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8"><style>.contents { display: contents; }</style></head>
+<body>
+  <template id="owner-approval">__OWNER_APPROVAL__</template>
+  <textarea></textarea>
+  <button aria-label="Send" disabled>Send</button>
+  <main role="log"></main>
+  <div data-hatch-composer-approval-stack="true">
+    <div data-hatch-approval-card-deck="true"></div>
+  </div>
+  <!-- The actual background summary shares the card's test id but isn't a decision surface. -->
+  <div data-testid="hatch-inline-approval-card" data-hatch-background-approval-surface="true">
+    <button id="summary">Review</button>
+  </div>
+  <div role="menu" id="unrelated" data-slot="dropdown-menu-content" data-radix-menu-content>
+    <div role="menuitem" onclick="fetch('/event', {method:'POST', body:'click:unrelated'})">이번만 허용</div>
+  </div>
+  <script>
+    const mode = "__MODE__";
+    const send = document.querySelector('button[aria-label="Send"]');
+    const input = document.querySelector("textarea");
+    const log = document.querySelector("main");
+    const deck = document.querySelector("[data-hatch-approval-card-deck]");
+    let hasSent = false;
+    let serial = 0;
+    const event = (name) => fetch("/event", { method: "POST", body: name, keepalive: true });
+    document.querySelector("#summary").onclick = () => event("click:review");
+
+    function complete() {
+      const result = document.createElement("div");
+      result.className = "hatch-agent-bubble-bg";
+      result.textContent = "Completed on the original page.";
+      log.append(result);
+      document.querySelector('[aria-label="Stop"]')?.remove();
+    }
+
+    function showCard() {
+      document.querySelector('#allow-menu')?.remove();
+      if (mode === "owner-markup") {
+        deck.replaceChildren(document.querySelector("#owner-approval").content.cloneNode(true));
+        const controls = deck.querySelectorAll("button[data-slot=button]");
+        ["allow", "always", "deny"].forEach((id, index) => { controls[index].id = id; });
+      } else deck.innerHTML = `
+        <div role="group" aria-label="Publish the fixture website"
+          data-testid="hatch-inline-approval-card" data-hatch-single-approval="true"
+          data-hatch-inline-approval-shortcut-surface="true" data-hatch-approval-surface="chat">
+          <p>Publish the fixture website</p>
+          <button id="detail">Show details</button>
+          <div>
+            <button id="deny">거절</button>
+            <div class="flex shrink-0 items-center">
+              <button id="allow" data-hatch-approval-primary-action="true">허용</button>
+              <button id="more" type="button" aria-label="More allow options" aria-haspopup="menu"
+                aria-expanded="false" data-slot="dropdown-menu-trigger">⋯</button>
+            </div>
+          </div>
+        </div>`;
+      function choose(button) {
+        button.onclick = async () => {
+          await event("click:" + button.id);
+          if (mode === "sequential" && serial === 1) {
+            const card = deck.firstElementChild;
+            card["__reactProps$fixture"] = { children: { props: { approval: { approvalId: "fixture-" + (++serial) } } } };
+            return;
+          }
+          document.querySelector('#allow-menu')?.remove();
+          deck.replaceChildren();
+          send.disabled = !input.value;
+          if (mode === "resuming") {
+            for (let frame = 0; frame < 4; frame++) await new Promise(requestAnimationFrame);
+            log.insertAdjacentHTML("beforeend", '<button aria-label="Stop">Stop</button>');
+            await event("resume-started");
+            for (let frame = 0; frame < 4; frame++) await new Promise(requestAnimationFrame);
+            complete();
+            await event("final");
+            return;
+          }
+          if (hasSent) complete();
+        };
+      }
+      deck.querySelectorAll("#deny,#allow,#always").forEach(choose);
+      const detail = deck.querySelector("#detail");
+      if (detail) detail.onclick = () => event("click:details");
+      const more = deck.querySelector("#more");
+      more?.addEventListener("pointerdown", (e) => {
+        e.preventDefault();
+        if (mode === "replace-opening-menu" && serial === 1) {
+          const card = deck.querySelector('[data-testid="hatch-inline-approval-card"]');
+          card["__reactProps$fixture"] = { children: { props: { approval: { approvalId: "fixture-" + (++serial) } } } };
+        }
+        more.setAttribute("aria-expanded", "true");
+        more.setAttribute("aria-controls", "allow-menu");
+        document.body.insertAdjacentHTML("beforeend", `
+          <div role="menu" id="allow-menu" data-slot="dropdown-menu-content" data-radix-menu-content>
+            <div id="once" role="menuitem">이번만 허용</div>
+            <div id="disabled" role="menuitem" aria-disabled="true" data-disabled>Disabled approval</div>
+          </div>`);
+        document.querySelectorAll("#once,#disabled").forEach(choose);
+      });
+      const card = deck.querySelector('[data-testid="hatch-inline-approval-card"]');
+      card["__reactProps$fixture"] = { children: { props: { approval: { approvalId: "fixture-" + (++serial) } } } };
+      send.disabled = true;
+    }
+    input.addEventListener("input", () => { send.disabled = !input.value || !!deck.firstElementChild; });
+    send.addEventListener("click", async () => {
+      hasSent = true;
+      log.innerHTML = '<div class="chat-user-bubble"></div><button aria-label="Stop">Stop</button>';
+      log.firstChild.textContent = input.value;
+      history.replaceState(null, "", "/thread/fixture");
+      await event("send");
+      if (mode === "before-send") complete();
+      else {
+        if (mode === "resuming") {
+          log.insertAdjacentHTML("beforeend", '<div class="hatch-agent-bubble-bg">Preparing, approval needed.</div>');
+          document.querySelector('[aria-label="Stop"]').remove();
+        }
+        showCard();
+      }
+    });
+    if (mode === "before-send") {
+      history.replaceState(null, "", "/thread/fixture");
+      showCard();
+    }
+    if (mode === "replace" || mode === "reuse") {
+      const interval = setInterval(async () => {
+        const { replace } = await (await fetch("/replace")).json();
+        if (replace) {
+          clearInterval(interval);
+          if (mode === "replace") showCard();
+          else deck.firstElementChild["__reactProps$fixture"] = { children: { props: { approval: { approvalId: "fixture-replacement" } } } };
+        }
+      }, 100);
+    }
+  </script>
+</body>
+</html>

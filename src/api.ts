@@ -2,7 +2,7 @@ import { timingSafeEqual } from "node:crypto";
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
 import { z } from "zod";
-import { accountIdSchema, GatewayError, jobIdSchema, providerIdSchema } from "./contracts";
+import { accountIdSchema, approvalChoiceIdSchema, GatewayError, jobIdSchema, jobResultError, providerIdSchema } from "./contracts";
 import type { ProviderId } from "./contracts";
 import type { Gateway } from "./gateway";
 import { chatBridgeInputSchema, prepareChatBridge, parseRemoteAssistant } from "./chat-bridge";
@@ -116,6 +116,15 @@ export function createApi(gateway: Gateway, dotsAuth?: DotsAuth, museLogin?: Mus
     if (!job) throw new GatewayError("job_not_found", "Job not found.", 404);
     return c.json({ job });
   });
+  app.post("/api/jobs/:id/approvals/:promptId", async (c) => {
+    if (!authorized(c.req.header("authorization"), gateway.store.apiKey)) {
+      throw new GatewayError("unauthorized", "API key required.", 401);
+    }
+    const id = jobIdSchema.parse(c.req.param("id"));
+    const { choiceId } = z.object({ choiceId: approvalChoiceIdSchema }).parse(await c.req.json());
+    await gateway.approve(id, c.req.param("promptId"), choiceId);
+    return c.json({ ok: true });
+  });
   app.get("/api/jobs/:id/images/:index", (c) => {
     const id = jobIdSchema.parse(c.req.param("id"));
     const index = z.coerce.number().int().min(0).parse(c.req.param("index"));
@@ -190,11 +199,17 @@ export function createApi(gateway: Gateway, dotsAuth?: DotsAuth, museLogin?: Mus
     const bridge = prepareChatBridge(body);
     for (const [name, value] of Object.entries(bridge.headers)) c.header(name, value);
     const thread = parseThreadKey(body.thread, c.req.header(THREAD_HEADER));
+    const respondAsync = c.req.header("prefer")?.split(",").some((value) => value.trim().toLowerCase() === "respond-async");
     const job = gateway.submit({ provider, prompt: bridge.prompt, kind: "chat", ...(thread ? { thread } : {}) });
     c.header("X-Dots2api-Job-Id", job.id);
     c.header("X-Dots2api-Usage", "unknown");
+    if (respondAsync) {
+      c.header("Preference-Applied", "respond-async");
+      c.header("Location", `/api/jobs/${job.id}`);
+      return c.json({ job }, 202);
+    }
     const result = await gateway.wait(job.id);
-    if (result.status !== "completed") throw new GatewayError("upstream_unconfirmed", result.error ?? "Remote result is not confirmed.", 502, result.status === "unknown");
+    if (result.status !== "completed") throw jobResultError(result);
     if (provider === "muse" && result.remoteId) c.header("X-Muse-Thread-Id", result.remoteId);
     // An image answer is reachable as a stored job image; an image-only answer still has a non-empty reply.
     const origin = new URL(c.req.url).origin;

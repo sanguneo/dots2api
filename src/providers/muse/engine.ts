@@ -1,12 +1,15 @@
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
-import { chromium } from "playwright";
+import { chromium, errors } from "playwright";
 import type { BrowserContext, Page } from "playwright";
 import { z } from "zod";
-import { GatewayError } from "../../contracts";
+import { GatewayError, MUSE_APPROVAL_TIMEOUT_MS } from "../../contracts";
 import type { AdapterContext, Credentials, ProviderAdapter, ReferenceImage, RunResult, ThreadDeletion } from "../../contracts";
 import { IMAGE_EXTENSIONS, MAX_IMAGES } from "../../images";
 import { attachmentsInPage, downloadFiles, FILE_CARD, generatedMedia } from "./media";
+import { ApprovalWait } from "./approval-wait";
+import { APPROVAL_CARD_SELECTOR, scanApprovalCard } from "./approval-dom";
+import { observeCompletion } from "./completion";
 export { fileBlock } from "./media";
 
 const configuration = z.object({
@@ -214,7 +217,7 @@ async function pruneCurrentThread(page: Page): Promise<boolean> {
 }
 
 /** The origin override permits a local synthetic Muse page in adapter tests. */
-export function createMuseAdapter(site = "https://muse.ai", chatTimeout = CHAT_TIMEOUT, pruneThreads = false): ProviderAdapter {
+export function createMuseAdapter(site = "https://muse.ai", chatTimeout = CHAT_TIMEOUT, pruneThreads = false, approvalTimeout = MUSE_APPROVAL_TIMEOUT_MS): ProviderAdapter {
   const origin = new URL(site);
 
   /**
@@ -319,6 +322,7 @@ export function createMuseAdapter(site = "https://muse.ai", chatTimeout = CHAT_T
       const browser = await openBrowser({ ...config, login: "false" }, context, origin);
       let submitted = false;
       let page: Page | undefined;
+      let approvals: ApprovalWait | undefined;
       try {
         page = browser.pages()[0] ?? await browser.newPage();
         // Muse can assign the side-chat URL after Send returns. Report it before a timeout or restart loses the key.
@@ -345,6 +349,8 @@ export function createMuseAdapter(site = "https://muse.ai", chatTimeout = CHAT_T
         // The composer mounts before the remote conversation finishes loading.
         await page.getByRole("log").waitFor({ state: "attached", timeout: 30_000 });
         await ensureAssignedSession(page, browser, config, context);
+        approvals = new ApprovalWait(page, context, scanApprovalCard, approvalTimeout);
+        while (await approvals.check()) { /* drain pre-existing prompts before using the composer */ }
         if (!reused && await page.locator('div[class*="hatch-chat-groupable-bubble"]').count()) {
           throw new GatewayError("muse_thread", "New Muse thread contains previous messages.", 502);
         }
@@ -357,38 +363,46 @@ export function createMuseAdapter(site = "https://muse.ai", chatTimeout = CHAT_T
         const baselineAttachments = await page.locator('[data-testid^="hatch-chat-attachment-presentation-"]').count();
         const baselineFiles = await page.locator(FILE_CARD).count();
         // Observe the actual Stop control transition, not text stability or a silent timeout.
-        await page.evaluate((knownAttachments: number) => {
-          let seenStop = false;
-          const root = document.documentElement;
-          const stopSelector = '[data-testid="hatch-composer-stop-button"], button[aria-label*="Stop" i], button[aria-label*="\u{505c}\u{6b62}"]';
-          const observe = () => {
-            // Skip the side panel's "Stop task" buttons: a running background task must not hide the reply's own Stop transition.
-            const stop = [...document.querySelectorAll(stopSelector)].find((el) => !/task|\u{4efb}\u{52a1}/iu.test(el.getAttribute("aria-label") ?? "")) ?? null;
-            if (stop) seenStop = true;
-            if (root.dataset["museComplete"] === "true" || !seenStop || stop) return;
-            if (!document.querySelector('div[class*="chat-user-bubble"]')) return;
-            const hasText = [...document.querySelectorAll('div[class*="hatch-agent-bubble-bg"]')].some((bubble) => bubble.textContent?.trim());
-            const hasMedia = document.querySelectorAll('[data-testid^="hatch-chat-attachment-presentation-"]').length > knownAttachments;
-            if (hasText || hasMedia) root.dataset["museComplete"] = "true";
-          };
-          new MutationObserver(observe).observe(document.body, { childList: true, subtree: true, attributes: true, characterData: true });
-          observe();
-        }, baselineAttachments);
+        await page.evaluate(observeCompletion, { knownAttachments: baselineAttachments, approvalSelector: APPROVAL_CARD_SELECTOR });
         await input.fill(prompt);
         // The composer itself has role=button and can inherit "Send" in its
         // accessible name. Only click the actual, explicitly labelled control.
         const send = page.locator('button[aria-label="Send"]').first();
-        await send.waitFor({ state: "visible", timeout: 10_000 });
-        if (!await send.isEnabled()) throw new GatewayError("muse_send", "Muse send button is disabled.", 502);
+        let sendBy = Date.now() + 10_000;
+        for (;;) {
+          const tick = Date.now();
+          if (await approvals.check()) {
+            sendBy += Date.now() - tick;
+            continue;
+          }
+          const remaining = sendBy - Date.now();
+          if (remaining <= 0) throw new GatewayError("muse_send", "Muse send button did not become actionable.", 502);
+          try {
+            // An approval can mount after fill and intercept Send. A trial can be repeated; the real click cannot.
+            await send.click({ trial: true, timeout: Math.min(250, remaining) });
+            if (!await approvals.check()) break;
+            sendBy += Date.now() - tick;
+          } catch (error) {
+            if (!(error instanceof errors.TimeoutError)) throw error;
+          }
+        }
         submitted = true; // A click can be accepted even if Playwright loses its acknowledgement.
         context.onSubmitted?.();
         await send.click();
         const threadId = /^\/thread\/([^/]+)\/?$/.exec(new URL(page.url()).pathname)?.[1];
         context.onAccepted?.(threadId && threadId !== "new" ? threadId : null);
-        await page.waitForFunction(() => {
-          if (!location.pathname.startsWith("/thread/")) throw new Error("Muse left the chat thread.");
-          return document.documentElement.dataset["museComplete"] === "true";
-        }, null, { timeout: chatTimeout });
+        let finishBy = Date.now() + chatTimeout;
+        for (;;) {
+          if (!new URL(page.url()).pathname.startsWith("/thread/")) throw new Error("Muse left the chat thread.");
+          const tick = Date.now();
+          if (await approvals.check()) {
+            finishBy += Date.now() - tick;
+            continue;
+          }
+          if (await page.evaluate(() => document.documentElement.dataset["museComplete"] === "true")) break;
+          if (Date.now() >= finishBy) throw new errors.TimeoutError("Muse generation completion timed out.");
+          await sleep(Math.min(125, finishBy - Date.now()));
+        }
         const media = await generatedMedia(page, { sources: baseline, cards: baselineAttachments });
         const images = media.images;
         // An image-only answer has no agent text bubble, and waiting for one timed out after the image had arrived.
@@ -413,7 +427,7 @@ export function createMuseAdapter(site = "https://muse.ai", chatTimeout = CHAT_T
         };
       } catch (error) {
         if (error instanceof GatewayError) {
-          if (!submitted || error.uncertain) throw error;
+          if (!submitted || error.uncertain || error.code === "approval_timeout") throw error;
           throw new GatewayError(error.code, error.message, error.status, true);
         }
         const cause = describeFailure(error, page);
@@ -425,6 +439,7 @@ export function createMuseAdapter(site = "https://muse.ai", chatTimeout = CHAT_T
           502, submitted,
         );
       } finally {
+        await approvals?.dispose();
         await browser.close();
       }
     },

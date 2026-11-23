@@ -15,7 +15,7 @@ chromium.launchPersistentContext = async (...args) => {
           const click = send.click.bind(send);
           send.click = async (...clickArgs) => {
             await click(...clickArgs);
-            throw new Error("Synthetic lost click acknowledgement");
+            if (!clickArgs[0]?.trial) throw new Error("Synthetic lost click acknowledgement");
           };
           return send;
         };

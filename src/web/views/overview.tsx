@@ -61,7 +61,7 @@ export function OverviewView() {
   const accountList = accounts.data ?? [];
   const jobList = jobs.data ?? [];
   const totals = countAccounts(accountList);
-  const running = jobList.filter((job) => job.status === "running").length;
+  const running = jobList.filter((job) => job.status === "running" || job.status === "approval_required").length;
   const failed = jobList.filter((job) => job.status === "failed").length;
   const unknownJobs = jobList.filter((job) => job.status === "unknown");
   const erroredAccounts = accountList.filter((account) => account.status === "error");

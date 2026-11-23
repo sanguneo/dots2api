@@ -8,7 +8,19 @@ export const jobIdSchema = z.string().uuid().brand<"JobId">();
 export type JobId = z.infer<typeof jobIdSchema>;
 export type Credentials = Readonly<Record<string, string>>;
 export type AccountStatus = "unconnected" | "ready" | "error";
-export type JobStatus = "queued" | "running" | "completed" | "failed" | "unknown";
+export const jobStatusSchema = z.enum(["queued", "running", "approval_required", "completed", "failed", "unknown"]);
+export type JobStatus = z.infer<typeof jobStatusSchema>;
+export const approvalChoiceIdSchema = z.string().min(1).max(80);
+export const approvalPromptIdSchema = z.string().min(1).max(80);
+export const jobApprovalSchema = z.object({
+  id: approvalPromptIdSchema,
+  description: z.string().min(1).max(500),
+  choices: z.array(z.object({ id: approvalChoiceIdSchema, label: z.string().min(1).max(120) }).readonly()).min(1).max(8).readonly(),
+  expiresAt: z.iso.datetime(),
+}).readonly();
+export type JobApproval = z.infer<typeof jobApprovalSchema>;
+/** Aggregate time allowed for human decisions in one Muse job. */
+export const MUSE_APPROVAL_TIMEOUT_MS = 600_000;
 
 export interface Account {
   readonly id: AccountId;
@@ -67,6 +79,8 @@ export interface Job {
   readonly status: JobStatus;
   readonly output: string;
   readonly error: string | null;
+  readonly errorCode?: string | undefined;
+  readonly approval?: JobApproval | undefined;
   readonly remoteId: string | null;
   readonly images: readonly JobImage[];
   readonly files?: readonly JobFile[];
@@ -126,6 +140,8 @@ export interface AdapterContext {
   /** Muse marks submission immediately before Send: a click can reach the provider even if acknowledgement fails. */
   readonly onSubmitted?: () => void;
   readonly onAccepted?: (remoteId: string | null) => void;
+  /** Advertise a live prompt; the returned callback withdraws it if the prompt ends without a click. */
+  readonly onApproval?: (approval: JobApproval, choose: (choiceId: string) => Promise<boolean>) => () => void;
   /** Present when the caller can persist credentials an adapter repaired (for example a rebound thread). */
   readonly saveCredentials?: (credentials: Credentials) => void;
 }
@@ -157,4 +173,11 @@ export class GatewayError extends Error {
     super(message);
     this.name = "GatewayError";
   }
+}
+
+export function jobResultError(job: Job): GatewayError {
+  const message = job.error ?? "Remote result is not confirmed.";
+  return job.errorCode === "approval_timeout"
+    ? new GatewayError("approval_timeout", message, 504)
+    : new GatewayError("upstream_unconfirmed", message, 502, job.status === "unknown");
 }
