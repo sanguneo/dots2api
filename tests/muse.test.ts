@@ -103,8 +103,9 @@ const html = `<!doctype html><html><body>
             document.body.insertAdjacentHTML("beforeend", '<div role="menu"><div role="menuitem">Copy</div><div role="menuitem" id="dl">Download</div><div role="menuitem">Download as PDF</div></div>');
             document.getElementById("dl").addEventListener("click", () => {
               const link = document.createElement("a");
-              link.href = input.value.includes("binary") ? "/file/archive.bin" : "/file/memo.md";
-              link.download = input.value.includes("binary") ? "archive.bin" : "memo.md"; document.body.append(link); link.click();
+              const filename = input.value.includes("binary") ? "archive.bin" : input.value.includes("pdf") ? "report.pdf" : "memo.md";
+              link.href = "/file/" + filename;
+              link.download = filename; document.body.append(link); link.click();
             });
           });
         });
@@ -142,6 +143,9 @@ describe("Muse browser adapter", () => {
         }
         if (path === "/file/archive.bin") return new Response(new Uint8Array(2 * 1024 * 1024 + 1).fill(255), {
           headers: { "content-type": "application/octet-stream", "content-disposition": 'attachment; filename="archive.bin"' },
+        });
+        if (path === "/file/report.pdf") return new Response(Uint8Array.from([37, 80, 68, 70, 45, 255]), {
+          headers: { "content-type": "application/pdf", "content-disposition": 'attachment; filename="report.pdf"' },
         });
         // The hosted copy of an uploaded reference; any job that returns these bytes returned the user's own upload.
         if (path === "/media/reference.png") return new Response(referencePng, { headers: { "content-type": "image/png" } });
@@ -275,6 +279,15 @@ describe("Muse browser adapter", () => {
     expect(result.files?.[0]?.name).toBe("archive.bin");
     expect(result.files?.[0]?.mime).toBe("application/octet-stream");
     expect(result.files?.[0]?.data).toEqual(new Uint8Array(2 * 1024 * 1024 + 1).fill(255));
+  }, 60_000);
+
+  it("preserves the MIME type of a downloaded PDF attachment", async () => {
+    const context = { accountId: accountA, dataDir, signal: new AbortController().signal };
+    await adapter.check({ cookieHeader: "hatch_sess=valid" }, context);
+    const result = await adapter.run({}, "file pdf", context);
+    expect(result.files).toEqual([{
+      name: "report.pdf", mime: "application/pdf", data: Uint8Array.from([37, 80, 68, 70, 45, 255]),
+    }]);
   }, 60_000);
 
   it("uploads reference images through the composer before the prompt is sent", async () => {
