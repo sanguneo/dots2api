@@ -17,6 +17,9 @@ function JobDetail({ job, account, provider }: { readonly job: Job; readonly acc
           경과 <Elapsed since={Date.parse(job.createdAt)} /> · 완료되면 이 화면이 자동으로 갱신됩니다.
         </Notice>
       ) : null}
+      {job.status === "approval_required" && job.approval ? (
+        <Notice tone="warn" title="원격 에이전트가 승인을 기다립니다">{job.approval.description}</Notice>
+      ) : null}
       {job.status === "queued" ? (
         <Notice title="앞선 작업이 끝나기를 기다립니다">
           같은 계정의 앞선 작업이 끝나면 이어서 실행됩니다. 순서가 되면 이 화면이 자동으로 갱신됩니다.
@@ -47,7 +50,7 @@ function JobDetail({ job, account, provider }: { readonly job: Job; readonly acc
         {job.output ? (
           <pre className="output">{job.output}</pre>
         ) : (
-          <p className="quiet">{job.status === "running" || job.status === "queued" ? "아직 결과가 없습니다." : "결과 텍스트가 없습니다."}</p>
+          <p className="quiet">{!job.finishedAt ? "아직 결과가 없습니다." : "결과 텍스트가 없습니다."}</p>
         )}
       </section>
 

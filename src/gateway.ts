@@ -1,5 +1,5 @@
-import { GatewayError, jobIdSchema } from "./contracts";
-import type { Account, AccountId, Credentials, Job, JobId, ProviderAdapter, ProviderId, ProviderStatus, ReferenceImage } from "./contracts";
+import { GatewayError, jobIdSchema, MUSE_APPROVAL_TIMEOUT_MS } from "./contracts";
+import type { Account, AccountId, AdapterContext, Credentials, Job, JobApproval, JobId, ProviderAdapter, ProviderId, ProviderStatus, ReferenceImage } from "./contracts";
 import { validateReferenceImages } from "./images";
 import { Store } from "./store";
 import { MuseThreads } from "./muse-threads";
@@ -22,10 +22,20 @@ export interface GatewayOptions {
 }
 type SideChatKind = "image" | "chat";
 interface SideChat { readonly kind: SideChatKind; readonly thread?: string }
+interface LiveApproval {
+  readonly prompt: JobApproval;
+  readonly choose: Parameters<NonNullable<AdapterContext["onApproval"]>>[1];
+  readonly withdraw: () => void;
+  submitting: boolean;
+}
+function approvalConflict(): GatewayError {
+  return new GatewayError("approval_conflict", "That approval choice is no longer available.", 409);
+}
 
 export class Gateway {
   private readonly busy = new Set<AccountId>();
   private readonly tasks = new Map<JobId, Promise<Job>>();
+  private readonly approvals = new Map<JobId, LiveApproval>();
   private readonly listeners = new Set<() => void>();
   private readonly shutdown = new AbortController();
   private readonly leases = new Set<Promise<void>>();
@@ -377,6 +387,21 @@ export class Gateway {
     if (!job) throw new GatewayError("job_not_found", "Job not found.", 404);
     return job;
   }
+  async approve(id: JobId, promptId: string, choiceId: string): Promise<void> {
+    if (!this.store.job(id)) throw new GatewayError("job_not_found", "Job not found.", 404);
+    const pending = this.approvals.get(id);
+    if (this.shutdown.signal.aborted || !pending || pending.submitting || pending.prompt.id !== promptId ||
+        Date.parse(pending.prompt.expiresAt) <= Date.now() || !pending.prompt.choices.some((choice) => choice.id === choiceId)) {
+      throw approvalConflict();
+    }
+    pending.submitting = true;
+    try {
+      if (!await pending.choose(choiceId)) throw approvalConflict();
+    } finally {
+      // Even an ambiguous worker outcome is never replayed.
+      pending.withdraw();
+    }
+  }
   private async execute(job: Job, referenceImages?: readonly ReferenceImage[], side?: SideChat): Promise<Job> {
     let remoteId: string | null = null;
     // Only Muse has side chats. A keyless request owns its chat: `job:<id>` can never match another request.
@@ -384,7 +409,8 @@ export class Gateway {
     const key = sideChat ? sideChat.thread ?? `job:${job.id}` : undefined;
     const reuse = sideChat?.thread && key ? this.store.museThread(job.accountId, sideChat.kind, key) : null;
     try {
-      const signal = AbortSignal.any([this.shutdown.signal, AbortSignal.timeout(660_000)]);
+      // The worker separately bounds generation and human decision time. Give Muse both budgets.
+      const signal = AbortSignal.any([this.shutdown.signal, AbortSignal.timeout(660_000 + (job.provider === "muse" ? MUSE_APPROVAL_TIMEOUT_MS : 0))]);
       const credentials = this.adapters[job.provider].validate(await this.credentials(job.accountId, signal));
       const result = await this.adapters[job.provider].run(credentials, job.prompt, {
         accountId: job.accountId, dataDir: this.store.dataDir, signal,
@@ -394,13 +420,28 @@ export class Gateway {
         ...(sideChat ? { pruneAfter: sideChat.kind === "chat" && !sideChat.thread } : {}),
         ...(sideChat?.thread ? { retryAccepted: false } : {}),
         saveCredentials: (repaired) => { this.store.saveAccount(this.account(job.accountId), repaired); },
+        onApproval: (prompt, choose) => {
+          this.approvals.get(job.id)?.withdraw();
+          const withdraw = () => {
+            if (this.approvals.get(job.id) !== pending) return;
+            this.approvals.delete(job.id);
+            this.store.saveJob({ ...job, remoteId, status: "running" });
+            this.changed();
+          };
+          const pending: LiveApproval = { prompt, choose, withdraw, submitting: false };
+          this.approvals.set(job.id, pending);
+          this.store.saveJob({ ...job, remoteId, status: "approval_required", approval: prompt });
+          this.changed();
+          return withdraw;
+        },
         onAccepted: (id) => {
           remoteId = id;
           // Persist the key as soon as Muse creates the chat, including across interrupted jobs/restarts.
           if (sideChat?.thread && id) {
             this.store.saveMuseThread({ accountId: job.accountId, kind: sideChat.kind, key: sideChat.thread, threadId: id, lastUsedAt: this.now() });
           }
-          this.store.saveJob({ ...job, remoteId });
+          const approval = this.approvals.get(job.id)?.prompt;
+          this.store.saveJob({ ...job, remoteId, ...(approval ? { status: "approval_required", approval } : {}) });
           this.changed();
         },
       });
@@ -450,9 +491,13 @@ export class Gateway {
       }
       return this.store.saveJob({
         ...job, remoteId, status: uncertain ? "unknown" : "failed", error: publicError(error),
+        ...(error instanceof GatewayError && error.code === "approval_timeout" ? { errorCode: error.code } : {}),
         finishedAt: new Date().toISOString(),
       });
-    } finally { this.changed(); }
+    } finally {
+      this.approvals.delete(job.id);
+      this.changed();
+    }
   }
 }
 

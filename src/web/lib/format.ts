@@ -13,6 +13,7 @@ export const accountStatusLabel: Readonly<Record<AccountStatus, string>> = {
 export const jobStatusLabel: Readonly<Record<JobStatus, string>> = {
   queued: "대기 중",
   running: "실행 중",
+  approval_required: "승인 대기",
   completed: "완료",
   failed: "실패",
   unknown: "결과 불확실",

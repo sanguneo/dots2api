@@ -1,12 +1,15 @@
 import { z } from "zod";
 import { accountIdSchema, GatewayError, MAX_FILE_BYTES, MAX_FILES } from "../../contracts";
 import { MAX_IMAGES } from "../../images";
+import type { AdapterContext } from "../../contracts";
 import { createMuseAdapter } from "./engine";
+import { approvalCommandSchema, COMMAND_LIMIT, jsonLines, REQUEST_LIMIT, workerProtocolError } from "./ipc";
 
 const requestSchema = z.object({
   operation: z.enum(["check", "run", "delete"]),
   site: z.url(),
   chatTimeout: z.number().positive(),
+  approvalTimeout: z.number().int().positive().optional(),
   credentials: z.record(z.string(), z.string()),
   accountId: accountIdSchema,
   dataDir: z.string(),
@@ -18,20 +21,46 @@ const requestSchema = z.object({
     dataB64: z.string().min(1),
   })).max(MAX_IMAGES).default([]),
 });
-const buffers: Buffer[] = [];
-for await (const chunk of process.stdin) buffers.push(Buffer.from(chunk));
 const controller = new AbortController();
 const abort = () => controller.abort();
 process.on("SIGTERM", abort);
 function emit(value: object): void { process.stdout.write(`${JSON.stringify(value)}\n`); }
+const inputLines = jsonLines(process.stdin, REQUEST_LIMIT, COMMAND_LIMIT, true);
+let approval: { readonly id: string; readonly choose: (choiceId: string) => Promise<boolean> } | undefined;
+const onApproval: NonNullable<AdapterContext["onApproval"]> = (prompt, choose) => {
+  const active = { id: prompt.id, choose };
+  approval = active;
+  emit({ type: "approval", prompt });
+  return () => {
+    if (approval !== active) return;
+    approval = undefined;
+    emit({ type: "approval_withdrawn", promptId: active.id });
+  };
+};
+async function commands(): Promise<void> {
+  try {
+    for await (const line of inputLines) {
+      const { promptId, choiceId } = approvalCommandSchema.parse(JSON.parse(line));
+      const clicked = approval?.id === promptId ? await approval.choose(choiceId) : false;
+      emit({ type: "approval_result", promptId, choiceId, clicked });
+    }
+  } catch {
+    controller.abort(workerProtocolError());
+  }
+}
 try {
-  const input = requestSchema.parse(JSON.parse(Buffer.concat(buffers).toString("utf8")));
-  const adapter = createMuseAdapter(input.site, input.chatTimeout, input.pruneThreads);
+  const line = await inputLines.next();
+  if (line.done) throw workerProtocolError();
+  const input = requestSchema.parse(JSON.parse(line.value));
+  const adapter = createMuseAdapter(input.site, input.chatTimeout, input.pruneThreads, input.approvalTimeout);
+  // Reading begins after the request frame, not after EOF; the gateway keeps stdin open during a run.
+  if (input.operation === "run") void commands();
   const context = {
     accountId: input.accountId, dataDir: input.dataDir, signal: controller.signal, threadId: input.threadId,
     referenceImages: input.referenceImages.map((image) => ({ mime: image.mime, data: new Uint8Array(Buffer.from(image.dataB64, "base64")) })),
     onAccepted: (remoteId: string | null) => emit({ type: "accepted", remoteId }),
     onSubmitted: () => emit({ type: "submitted" }),
+    onApproval,
     saveCredentials: (credentials: Record<string, string>) => emit({ type: "credentials", credentials }),
   };
   switch (input.operation) {
@@ -82,4 +111,7 @@ try {
     status: error instanceof GatewayError ? error.status : 502,
     uncertain: error instanceof GatewayError ? error.uncertain : true,
   });
-} finally { process.off("SIGTERM", abort); }
+} finally {
+  process.stdin.destroy();
+  process.off("SIGTERM", abort);
+}

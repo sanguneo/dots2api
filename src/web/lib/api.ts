@@ -1,6 +1,6 @@
 import ky, { HTTPError, TimeoutError } from "ky";
 import { z } from "zod";
-import { accountIdSchema, jobIdSchema, providerIdSchema } from "../../contracts";
+import { accountIdSchema, jobApprovalSchema, jobIdSchema, jobStatusSchema, providerIdSchema } from "../../contracts";
 import type { Account, AccountId, CredentialField, Job, JobId, ProviderId, ProviderStatus } from "../../contracts";
 
 const credentialFieldSchema = z.object({
@@ -49,9 +49,11 @@ const jobSchema = z.object({
   accountId: accountIdSchema,
   provider: providerIdSchema,
   prompt: z.string(),
-  status: z.enum(["queued", "running", "completed", "failed", "unknown"]),
+  status: jobStatusSchema,
   output: z.string(),
   error: z.string().nullable(),
+  errorCode: z.string().optional(),
+  approval: jobApprovalSchema.optional(),
   remoteId: z.string().nullable(),
   images: z.array(z.object({
     mime: z.enum(["image/png", "image/jpeg", "image/webp"]), bytes: z.number(),

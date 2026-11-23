@@ -8,7 +8,7 @@ import { Button, Elapsed, Notice, StatusBadge, TimeText } from "./ui";
 import type { Tone } from "./ui";
 
 const accountTone = { unconnected: "neutral", ready: "ok", error: "danger" } as const satisfies Record<AccountStatus, Tone>;
-const jobTone = { queued: "neutral", running: "accent", completed: "ok", failed: "danger", unknown: "warn" } as const satisfies Record<JobStatus, Tone>;
+const jobTone = { queued: "neutral", running: "accent", approval_required: "warn", completed: "ok", failed: "danger", unknown: "warn" } as const satisfies Record<JobStatus, Tone>;
 
 export function AccountStatusBadge({ account, checkStartedAt }: { readonly account: Account; readonly checkStartedAt?: number | undefined }) {
   if (checkStartedAt !== undefined) {
@@ -53,7 +53,7 @@ export function JobRow({ job, account, provider, now }: JobRowProps) {
         <TimeText iso={job.createdAt} now={now} />
       </span>
       <span className="job-row__duration">
-        {job.status === "running" ? <Elapsed since={Date.parse(job.createdAt)} /> : duration === null ? "—" : formatDuration(duration)}
+        {job.status === "running" || job.status === "approval_required" ? <Elapsed since={Date.parse(job.createdAt)} /> : duration === null ? "—" : formatDuration(duration)}
       </span>
     </a>
   );

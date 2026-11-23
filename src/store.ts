@@ -3,7 +3,7 @@ import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
-import { accountIdSchema, jobIdSchema, providerIdSchema } from "./contracts";
+import { accountIdSchema, jobApprovalSchema, jobIdSchema, jobStatusSchema, providerIdSchema } from "./contracts";
 import type { Account, AccountId, Credentials, Job, JobFile, JobId, JobImage, ProviderId, RunFile, RunImage } from "./contracts";
 import { IMAGE_EXTENSIONS, IMAGE_MIMES, MAX_IMAGE_BYTES, MAX_IMAGES, pngSize, sniffImage } from "./images";
 import { JobFiles, jobFilesSchema } from "./job-files";
@@ -34,9 +34,11 @@ const jobSchema = z.object({
   accountId: accountIdSchema,
   provider: providerIdSchema,
   prompt: z.string(),
-  status: z.enum(["queued", "running", "completed", "failed", "unknown"]),
+  status: jobStatusSchema,
   output: z.string(),
   error: z.string().nullable(),
+  errorCode: z.string().optional(),
+  approval: jobApprovalSchema.optional(),
   remoteId: z.string().nullable(),
   images: z.array(z.object({
     mime: z.enum(IMAGE_MIMES), bytes: z.number().int().nonnegative(),
@@ -124,7 +126,7 @@ export class Store {
 
   /** Called by the serving process at startup, never by read-only diagnostics. */
   recoverInterruptedJobs(): void {
-    const unfinished = this.db.query<Row, []>("SELECT body FROM jobs WHERE json_extract(body, '$.status') IN ('queued', 'running')")
+    const unfinished = this.db.query<Row, []>("SELECT body FROM jobs WHERE json_extract(body, '$.status') IN ('queued', 'running', 'approval_required')")
       .all().map((row) => jobSchema.parse(JSON.parse(row.body)));
     for (const job of unfinished) {
       if (job.status === "queued") {
@@ -137,10 +139,11 @@ export class Store {
         });
         continue;
       }
-      if (job.status === "running") {
+      if (job.status === "running" || job.status === "approval_required") {
         this.saveJob({
           ...job,
           status: "unknown",
+          approval: undefined,
           error: "Gateway restarted. Remote work may still be running; check the provider before retrying.",
           finishedAt: new Date().toISOString(),
         });
@@ -249,10 +252,10 @@ export class Store {
     rmSync(join(this.dataDir, "images", id), { recursive: true, force: true });
     this.files.remove(id);
   }
-  /** Deletes finished jobs and their media before `cutoff` (ISO time); queued and running jobs stay. */
+  /** Deletes finished jobs and their media before `cutoff` (ISO time); active jobs stay. */
   pruneJobs(cutoff: string): number {
     const old = this.db.query<{ id: string }, [string]>(`
-      SELECT id FROM jobs WHERE json_extract(body, '$.status') NOT IN ('queued', 'running')
+      SELECT id FROM jobs WHERE json_extract(body, '$.status') NOT IN ('queued', 'running', 'approval_required')
         AND COALESCE(json_extract(body, '$.finishedAt'), json_extract(body, '$.createdAt')) < ?
     `).all(cutoff);
     const remove = this.db.query("DELETE FROM jobs WHERE id=?");
