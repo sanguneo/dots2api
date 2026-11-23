@@ -162,3 +162,19 @@ test("watch publishes new task T once even if its file arrives later, and still 
   expect(results.map(result => ({ text: result.text, files: (result.files ?? []).map(({ name }) => name) })))
     .toEqual([{ text: taskText, files: [] }, { text: "", files: [fileU] }]);
 }, 75_000);
+
+test("watch learns historical bytes that hydrate after baseline before their row is relabeled", async () => {
+  const placeholder = row("row-A", '<div data-testid="hatch-chat-attachment-presentation-A"></div>');
+  const relabeled = image("row-B", "B", oldPng);
+  const lateFile = row("row-B", `<div data-testid="hatch-chat-attachment-presentation-B"><img data-png="${oldPng}" alt="Old image"></div>${file(fileT)}`);
+  const results = await observeWatch(placeholder, async ({ showForVisits }) => {
+    await showForVisits(image("row-A", "A", oldPng), 1);
+    await showForVisits(relabeled, 3);
+    await showForVisits(lateFile, 1);
+    await showForVisits(lateFile + image("row-C", "C", newPng), 1);
+  });
+  expect(results.flatMap(result => result.images ?? []).map(({ data }) => Buffer.from(data).toString("base64")))
+    .toEqual([newPng]);
+  expect(results.flatMap(result => result.files ?? [])).toEqual([]);
+  expect(results).toHaveLength(1);
+}, 75_000);

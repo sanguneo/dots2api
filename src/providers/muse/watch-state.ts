@@ -53,10 +53,11 @@ export async function readTranscript(page: Page, sourceHashes?: Map<string, stri
         .map(element => `${element.closest("[data-message-id]")?.getAttribute("data-message-id") ?? ""}\n${element.getAttribute("data-testid") ?? ""}`),
       messageIds: [...document.querySelectorAll("[data-message-id]")].map(element => element.getAttribute("data-message-id") ?? ""),
       files: [...document.querySelectorAll(fileSelector)].flatMap((element) => element.getAttribute("data-testid") ?? []),
-      fileCards: [...document.querySelectorAll(fileSelector)].map(element => ({
-        id: element.getAttribute("data-testid") ?? "",
-        owner: element.closest("[data-message-id]")?.getAttribute("data-message-id") ?? "",
-      })),
+      fileCards: [...document.querySelectorAll(fileSelector)].map(element => {
+        const owner = element.closest("[data-message-id]")?.getAttribute("data-message-id") ?? "";
+        const presentation = element.closest('[data-testid^="hatch-chat-attachment-presentation-"]')?.getAttribute("data-testid");
+        return { id: element.getAttribute("data-testid") ?? "", owner, presentation: presentation ? `${owner}\n${presentation}` : "" };
+      }),
       users: [...document.querySelectorAll<HTMLElement>('[data-message-item="true"][data-message-role="user"],div[class*="chat-user-bubble"]')]
         .map((element) => `${element.getAttribute("data-message-id") ?? ""}\n${element.innerText.trim()}`),
       generating: Boolean(document.querySelector('[data-testid="hatch-composer-stop-button"],button[aria-label="Stop"]')),
@@ -65,10 +66,11 @@ export async function readTranscript(page: Page, sourceHashes?: Map<string, stri
   const attachments = (await page.evaluate(attachmentsInPage)).filter(({ src }) => !src.startsWith("data:image/svg"));
   const sources = attachments.map(({ src }) => src);
   const identities = await Promise.all(attachments.map(async item => {
+    const owner = { owner: item.message, presentation: item.presentation ? `${item.message}\n${item.presentation}` : "" };
     const key = item.message ? digest(`message\n${item.message}`) :
       item.presentation ? digest(`presentation\n\n${item.presentation}`) : null;
     // Foreground checkpoints only need known DOM owners; unavailable history must not fail a plain request.
-    if (!sourceHashes && key) return { hash: null, key };
+    if (!sourceHashes && key) return { ...owner, hash: null, key };
     const cacheKey = `${item.message}\n${item.presentation}\n${item.src}`;
     let hash = sourceHashes?.get(cacheKey);
     if (!hash) {
@@ -77,7 +79,7 @@ export async function readTranscript(page: Page, sourceHashes?: Map<string, stri
       hash = digest(Buffer.from(bytes.b64, "base64"));
       sourceHashes?.set(cacheKey, hash);
     }
-    return { hash, key: key ?? hash };
+    return { ...owner, hash, key: key ?? hash };
   }));
   const snapshot = {
     messages: contents.messages.map(({ id, text }) => digest(`${id}\n${text}`)),
@@ -87,5 +89,5 @@ export async function readTranscript(page: Page, sourceHashes?: Map<string, stri
     messageIds: contents.messageIds,
     texts: contents.messages.filter(message => message.text).map(message => digest(message.text)),
   };
-  return { ...contents, sources, snapshot };
+  return { ...contents, sources, snapshot, media: identities };
 }

@@ -79,6 +79,30 @@ export async function watchMusePage(page: Page, origin: URL, context: MuseWatchC
       context.onWatchBaseline?.(id, current.snapshot.mediaHashes);
       return;
     }
+    // Historical rows can acquire bytes later, then be remounted under new DOM identities.
+    // Learn that evidence before any no-delta or pending-task return.
+    const historical = current.media.filter(item => {
+      const knownOwner = baseline.mediaKeys.includes(item.key) || baseline.messageIds.includes(item.owner) ||
+        baseline.presentations.includes(item.presentation);
+      const knownBytes = item.hash !== null && baseline.mediaHashes.includes(item.hash);
+      const newCaption = current.messages.some(message => message.id === item.owner && message.text &&
+        !baseline.texts.includes(digest(message.text)));
+      return knownOwner || (knownBytes && !newCaption);
+    });
+    const hashes = [...new Set(historical.flatMap(item => item.hash ? [item.hash] : []))]
+      .filter(hash => !baseline.mediaHashes.includes(hash));
+    const keys = [...new Set(historical.map(item => item.key))].filter(key => !baseline.mediaKeys.includes(key));
+    const owners = [...new Set(historical.map(item => item.owner))].filter(owner => owner && !baseline.messageIds.includes(owner));
+    const presentations = [...new Set(historical.map(item => item.presentation))]
+      .filter(presentation => presentation && !baseline.presentations.includes(presentation));
+    if (hashes.length || keys.length || owners.length || presentations.length) {
+      baseline.mediaHashes.push(...hashes);
+      baseline.mediaKeys.push(...keys);
+      baseline.messageIds.push(...owners);
+      baseline.presentations.push(...presentations);
+      await save();
+      if (hashes.length) context.onWatchBaseline?.(id, hashes);
+    }
     const original = threads.get(id)?.output.trim();
     const text = current.messages.filter(({ id: messageId, text }, index) => text &&
       !baseline.texts.includes(digest(text)) && (!messageId || !baseline.messageIds.includes(messageId)) &&
@@ -89,7 +113,8 @@ export async function watchMusePage(page: Page, origin: URL, context: MuseWatchC
       !baseline.messageIds.some(message => digest(`message\n${message}`) === key) &&
       !baseline.presentations.some(presentation => digest(`presentation\n${presentation}`) === key));
     const freshCards = current.fileCards.filter(card => !baseline.files.includes(digest(card.id)) &&
-      (!card.owner || !baseline.messageIds.includes(card.owner)));
+      (!card.owner || !baseline.messageIds.includes(card.owner)) &&
+      (!card.presentation || !baseline.presentations.includes(card.presentation)));
     const freshFiles = new Set(freshCards.map(card => card.id));
     const hasDelta = text || freshMedia || freshFiles.size;
     if (!hasDelta || current.generating || await page.evaluate(hasPendingMuseTask)) {
@@ -121,7 +146,8 @@ export async function watchMusePage(page: Page, origin: URL, context: MuseWatchC
     const result = {
       text: body, remoteId: id, images: media.images, files, deliveryId: fingerprint,
       followupKeys: [
-        ...freshCards.map(card => digest(card.owner ? `message\n${card.owner}` : `file\n${card.id}`)),
+        ...freshCards.map(card => digest(card.owner ? `message\n${card.owner}` :
+          card.presentation ? `presentation\n${card.presentation}` : `file\n${card.id}`)),
         ...current.snapshot.messageIds.filter(m => !baseline.messageIds.includes(m)).map(m => digest(`message\n${m}`)),
         ...current.presentations.filter(p => !baseline.presentations.includes(p)).map(p => digest(`presentation\n${p}`)),
         ...current.snapshot.messages.filter(message => !baseline.messages.includes(message)),
