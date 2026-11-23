@@ -2,8 +2,8 @@ import { appendFile, mkdir, stat, truncate } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
-import { GatewayError } from "../contracts";
-import type { AdapterContext, CheckResult, Credentials, ProviderAdapter, RunImage, RunResult, ThreadDeletion } from "../contracts";
+import { GatewayError, MAX_FILE_BYTES, MAX_FILES } from "../contracts";
+import type { AdapterContext, CheckResult, Credentials, ProviderAdapter, RunFile, RunImage, RunResult, ThreadDeletion } from "../contracts";
 import { createMuseAdapter as createBrowserAdapter, sanitizeDiagnostics } from "./muse/engine";
 
 const MAX_ATTEMPTS = 2;
@@ -43,10 +43,14 @@ const eventSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("credentials"), credentials: z.record(z.string(), z.string()) }),
   z.object({ type: z.literal("checked"), detail: z.string() }),
   z.object({ type: z.literal("deleted"), outcome: z.enum(["deleted", "gone", "failed"]) }),
+  z.object({ type: z.literal("file"), name: z.string(), mime: z.string(), dataB64: z.string().max(Math.ceil(MAX_FILE_BYTES / 3) * 4) }),
   z.object({ type: z.literal("completed"), text: z.string(), remoteId: z.string().nullable(), images: z.array(imageSchema).default([]) }),
   z.object({ type: z.literal("failed"), code: z.string(), message: z.string(), status: z.number(), uncertain: z.boolean() }),
 ]);
-type Terminal = Exclude<z.infer<typeof eventSchema>, { type: "submitted" } | { type: "accepted" } | { type: "credentials" }>;
+type WorkerEvent = z.infer<typeof eventSchema>;
+type Terminal = Extract<WorkerEvent, { type: "checked" | "deleted" | "completed" | "failed" }>;
+type WorkerReply = Exclude<Terminal, { type: "failed" } | { type: "completed" }>
+  | (Extract<Terminal, { type: "completed" }> & { readonly files: readonly RunFile[] });
 
 // Compile our TypeScript worker once; the browser's officially supported Node
 // runtime owns all Playwright subprocesses. Credentials travel over stdin only.
@@ -93,7 +97,7 @@ async function callWorker(
   credentials: Credentials,
   prompt: string,
   context: AdapterContext,
-): Promise<Terminal> {
+): Promise<WorkerReply> {
   const node = nodeBinary();
   if (context.signal.aborted) throw new GatewayError("muse_cancelled", "Muse operation cancelled.", 409);
   const child = Bun.spawn([node, "--input-type=module", "--eval", await workerProgram()], {
@@ -116,27 +120,40 @@ async function callWorker(
   const reader = child.stdout.getReader();
   let terminal: Terminal | undefined;
   let outcome = "the worker ended before confirming a result";
-  let buffer = "";
+  const files: RunFile[] = [];
+  let fragments: string[] = [];
   const decoder = new TextDecoder();
   try {
     while (true) {
       const chunk = await reader.read();
       if (chunk.done) break;
-      buffer += decoder.decode(chunk.value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() ?? "";
-      for (const line of lines.filter(Boolean)) {
+      const lines = decoder.decode(chunk.value, { stream: true }).split("\n");
+      const tail = lines.pop() ?? "";
+      for (const piece of lines) {
+        fragments.push(piece);
+        const line = fragments.join("");
+        fragments = [];
+        if (!line) continue;
         const event = eventSchema.parse(JSON.parse(line));
         switch (event.type) {
           case "submitted": context.onSubmitted?.(); break;
           case "accepted": context.onAccepted?.(event.remoteId); break;
           case "credentials": context.saveCredentials?.(event.credentials); break;
+          case "file": {
+            const data = Buffer.from(event.dataB64, "base64");
+            if (files.length >= MAX_FILES || data.byteLength > MAX_FILE_BYTES) {
+              throw new GatewayError("muse_worker", "Muse worker exceeded the attachment limit.", 502, true);
+            }
+            files.push({ name: event.name, mime: event.mime, data });
+            break;
+          }
           case "checked":
           case "deleted":
           case "completed":
           case "failed": terminal = event; break;
         }
       }
+      if (tail) fragments.push(tail);
     }
     const code = await child.exited;
     await stderr;
@@ -146,7 +163,7 @@ async function callWorker(
       throw new GatewayError(terminal.code, terminal.message, terminal.status, terminal.uncertain);
     }
     outcome = terminal.type === "completed" ? "completed" : "checked";
-    return terminal;
+    return terminal.type === "completed" ? { ...terminal, files } : terminal;
   } catch (error) {
     if (error instanceof GatewayError) throw error;
     outcome = "the worker response could not be verified";
@@ -191,7 +208,11 @@ export function createMuseAdapter(site = "https://muse.ai", chatTimeout = 600_00
       ...(image.height !== undefined ? { height: image.height } : {}),
       ...(image.revisedPrompt !== undefined ? { revisedPrompt: image.revisedPrompt } : {}),
     }));
-    return { text: result.text, remoteId: result.remoteId, ...(images.length ? { images } : {}) };
+    return {
+      text: result.text, remoteId: result.remoteId,
+      ...(images.length ? { images } : {}),
+      ...(result.files.length ? { files: result.files } : {}),
+    };
   };
   return {
     info: definition.info,

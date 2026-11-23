@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { accountIdSchema, GatewayError } from "../../contracts";
+import { accountIdSchema, GatewayError, MAX_FILE_BYTES, MAX_FILES } from "../../contracts";
 import { MAX_IMAGES } from "../../images";
 import { createMuseAdapter } from "./engine";
 
@@ -45,9 +45,23 @@ try {
     }
     case "run": {
       const result = await adapter.run(input.credentials, input.prompt, context);
+      let sent = 0;
+      for (const file of result.files ?? []) {
+        if (sent >= MAX_FILES) break;
+        if (file.data.byteLength > MAX_FILE_BYTES) continue;
+        // Send separate events to keep base64 for multiple attachments out of a single JSON record.
+        const event = JSON.stringify({
+          type: "file", name: file.name, mime: file.mime,
+          dataB64: Buffer.from(file.data.buffer, file.data.byteOffset, file.data.byteLength).toString("base64"),
+        });
+        await new Promise<void>((resolve, reject) =>
+          process.stdout.write(`${event}\n`, (error) => error ? reject(error) : resolve()));
+        sent++;
+      }
+      const omitted = (result.files?.length ?? 0) - sent;
       emit({
         type: "completed",
-        text: result.text,
+        text: omitted ? `${result.text}\n\n[dots2api] ${omitted} file(s) exceeded the attachment size or count limit.` : result.text,
         remoteId: result.remoteId,
         images: (result.images ?? []).map((image) => ({
           mime: image.mime,

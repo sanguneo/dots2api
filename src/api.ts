@@ -128,6 +128,21 @@ export function createApi(gateway: Gateway, dotsAuth?: DotsAuth, museLogin?: Mus
       "Content-Security-Policy": "default-src 'none'; sandbox",
     });
   });
+  app.get("/api/jobs/:id/files/:index", (c) => {
+    const id = jobIdSchema.parse(c.req.param("id"));
+    const index = z.string().regex(/^(0|[1-9][0-9]*)$/).transform(Number).pipe(z.number().int()).parse(c.req.param("index"));
+    const file = gateway.store.file(id, index);
+    if (!file) throw new GatewayError("file_not_found", "File not found.", 404);
+    const { name, mime, bytes } = file.metadata;
+    const fallback = name.replace(/[^a-zA-Z0-9._ -]/g, "_");
+    const encoded = encodeURIComponent(name).replace(/['()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
+    return c.body(file.data.stream(), 200, {
+      "Content-Type": mime,
+      "Content-Length": String(bytes),
+      "Content-Disposition": `attachment; filename="${fallback}"; filename*=UTF-8''${encoded}`,
+      "Content-Security-Policy": "default-src 'none'; sandbox",
+    });
+  });
   app.get("/api/settings", (c) => c.json({ apiKey: gateway.store.apiKey, baseUrl: `${new URL(c.req.url).origin}/v1` }));
   app.get("/api/events", (c) => streamSSE(c, async (stream) => {
     let sequence = 0;
@@ -188,18 +203,24 @@ export function createApi(gateway: Gateway, dotsAuth?: DotsAuth, museLogin?: Mus
       : [];
     const text = [result.output, ...imageLinks].filter((part) => part.trim().length > 0).join("\n\n");
     const completion = parseRemoteAssistant(text, bridge);
+    const fileLinks = (result.files ?? []).map(({ name }, index) =>
+      `[${name.replace(/[\\[\]]/g, "\\$&")}](${origin}/api/jobs/${job.id}/files/${index})`);
+    const message = fileLinks.length ? {
+      ...completion.message,
+      content: [completion.message.content, ...fileLinks].filter((part) => part?.trim()).join("\n\n"),
+    } : completion.message;
     const id = `chatcmpl-${job.id}`;
     const created = Math.floor(Date.now() / 1000);
     if (!body.stream) return c.json({
       id, object: "chat.completion", created, model: body.model,
-      choices: [{ index: 0, message: completion.message, finish_reason: completion.finish_reason }],
+      choices: [{ index: 0, message, finish_reason: completion.finish_reason }],
     });
     // Buffered result delivery is explicit: no manufactured token pacing or usage counters.
     c.header("X-Dots2api-Streaming", "buffered");
     return streamSSE(c, async (stream) => {
       await stream.writeSSE({ data: JSON.stringify({
         id, object: "chat.completion.chunk", created, model: body.model,
-        choices: [{ index: 0, delta: { ...completion.message, ...(completion.finish_reason === "tool_calls" ? { tool_calls: completion.message.tool_calls.map((call, index) => ({ index, ...call })) } : {}) }, finish_reason: null }],
+        choices: [{ index: 0, delta: { ...message, ...(completion.finish_reason === "tool_calls" ? { tool_calls: completion.message.tool_calls.map((call, index) => ({ index, ...call })) } : {}) }, finish_reason: null }],
       }) });
       await stream.writeSSE({ data: JSON.stringify({
         id, object: "chat.completion.chunk", created, model: body.model,

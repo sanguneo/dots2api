@@ -41,6 +41,19 @@ export interface RunImage {
   readonly height?: number | undefined;
   readonly revisedPrompt?: string;
 }
+export const MAX_FILES = 3;
+export const MAX_FILE_BYTES = 50 * 1024 * 1024;
+/** Metadata only; the file body is fetched separately by job and index. */
+export interface JobFile {
+  readonly name: string;
+  readonly mime: string;
+  readonly bytes: number;
+}
+export interface RunFile {
+  readonly name: string;
+  readonly mime: string;
+  readonly data: Uint8Array;
+}
 /** Validated reference bytes supplied by the caller, separate from prompt text and generated images. */
 export interface ReferenceImage {
   readonly mime: JobImage["mime"];
@@ -56,6 +69,7 @@ export interface Job {
   readonly error: string | null;
   readonly remoteId: string | null;
   readonly images: readonly JobImage[];
+  readonly files?: readonly JobFile[];
   readonly createdAt: string;
   readonly finishedAt: string | null;
 }
@@ -94,6 +108,7 @@ export interface RunResult {
   readonly text: string;
   readonly remoteId: string | null;
   readonly images?: readonly RunImage[];
+  readonly files?: readonly RunFile[];
 }
 export interface AdapterContext {
   readonly accountId: AccountId;

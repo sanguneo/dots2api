@@ -1,12 +1,13 @@
 import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { chromium } from "playwright";
 import type { BrowserContext, Page } from "playwright";
 import { z } from "zod";
 import { GatewayError } from "../../contracts";
-import type { AdapterContext, Credentials, ProviderAdapter, ReferenceImage, RunImage, RunResult, ThreadDeletion } from "../../contracts";
+import type { AdapterContext, Credentials, ProviderAdapter, ReferenceImage, RunResult, ThreadDeletion } from "../../contracts";
 import { IMAGE_EXTENSIONS, MAX_IMAGES } from "../../images";
+import { attachmentsInPage, downloadFiles, FILE_CARD, generatedMedia } from "./media";
+export { fileBlock } from "./media";
 
 const configuration = z.object({
   cookieHeader: z.string().trim().optional(),
@@ -21,20 +22,8 @@ const CHAT_TIMEOUT = 600_000;
 /** A thread id goes into a URL path, so only the characters Muse itself uses are allowed. */
 const THREAD_ID = /^[A-Za-z0-9_-]{1,128}$/;
 const ATTACHMENT_TIMEOUT = 10_000;
-/**
- * After completion with no new attachment card, a late image gets this grace instead of the full attachment wait. Every
- * text-only chat reply used to pay the whole ATTACHMENT_TIMEOUT here, about half of a short muse-agent answer.
- */
-const LATE_IMAGE_GRACE = 2_000;
 /** References can total 32 MiB, so their upload gets its own, much longer, budget than a thumbnail read. */
 const REFERENCE_UPLOAD_TIMEOUT = 120_000;
-const MEDIA_LOAD_TIMEOUT = 10_000;
-/** A file card in the chat, never the composer or the user's own messages. */
-const FILE_CARD = '[data-testid^="hatch-chat-file-card-"]:not([data-hatch-composer-chrome] *):not([class*=chat-user-bubble] *)';
-const FILE_STEP_TIMEOUT = 8_000;
-const FILE_MAX_BYTES = 2 * 1024 * 1024;
-const FILE_MAX_COUNT = 3;
-const FILE_END = "[[/file]]";
 const VM_WAKE_TIMEOUT = 60_000;
 /** Muse's own authentication cookies; only these are persisted back to the account. */
 const ESSENTIAL_COOKIES = new Set(["hatch_sess", "hatch_gw", "hatch_vml", "hatch_native_auth_device"]);
@@ -138,16 +127,6 @@ function cookiesFrom(credentials: Credentials, origin: URL) {
   }));
 }
 
-interface Attachment {
-  readonly tid: string;
-  readonly hasVideo: boolean;
-  readonly src: string;
-  readonly vSrc: string;
-  readonly iSrc: string;
-  readonly w: number;
-  readonly h: number;
-}
-
 /**
  * Sends reference images through Muse's own composer and waits until the composer itself reports them attached: one
  * `blob:` thumbnail per reference, a Remove control for each, and an enabled Send button. A prompt sent before that is
@@ -177,49 +156,6 @@ async function attachReferences(page: Page, references: readonly ReferenceImage[
 }
 
 /**
- * Runs inside the page. Collects generated media from the attachment cards and the agent bubbles, while
- * excluding the composer, the user's own uploads and history, and avatar/emoji imagery. This mirrors the
- * selectors the community muse.ai clients rely on and is re-checked against the live DOM in `check`.
- */
-function attachmentsInPage(): Attachment[] {
-  const list: Attachment[] = [];
-  const seenElement = new Set<Element>();
-  const seenSource = new Set<string>();
-  const addElement = (element: Element | null, tid: string): void => {
-    if (!element || seenElement.has(element)) return;
-    seenElement.add(element);
-    // A file card shows a small type icon, not a picture; the file itself is fetched by `downloadFiles`.
-    if (tid.endsWith("-file") || element.querySelector('[data-testid^="hatch-chat-file-card-"]')) return;
-    // The live composer has no <form>; it is marked data-hatch-composer-chrome and holds the user's own uploads.
-    if (element.closest('form, [data-hatch-composer-chrome], [class*=chat-user-bubble], [class*="group/msg"]')) return;
-    const video = element.querySelector("video") ?? (element.tagName === "VIDEO" ? element : null);
-    const image = element.querySelector("img") ?? (element.tagName === "IMG" ? element : null);
-    const isVideo = (tid || "").includes("video") || video !== null;
-    const primary = (isVideo ? (video ?? image) : (image ?? video)) as (HTMLImageElement & HTMLVideoElement) | null;
-    const src = primary ? (primary.currentSrc || primary.src || "") : "";
-    if (!src || seenSource.has(src)) return;
-    seenSource.add(src);
-    list.push({
-      tid: tid || element.getAttribute("data-testid") || (isVideo ? "video" : "image"),
-      hasVideo: video !== null,
-      src,
-      vSrc: video ? ((video as HTMLVideoElement).currentSrc || (video as HTMLVideoElement).src || "") : "",
-      iSrc: image ? ((image as HTMLImageElement).currentSrc || (image as HTMLImageElement).src || "") : "",
-      w: primary ? (primary.videoWidth || primary.naturalWidth || 0) : 0,
-      h: primary ? (primary.videoHeight || primary.naturalHeight || 0) : 0,
-    });
-  };
-  document.querySelectorAll('[data-testid^="hatch-chat-attachment-presentation-"]').forEach((element) => {
-    addElement(element, element.getAttribute("data-testid") ?? "");
-  });
-  document.querySelectorAll('div[class*="hatch-agent-bubble-bg"] img, div[class*="hatch-agent-bubble-bg"] video').forEach((media) => {
-    const src = (media as HTMLImageElement).currentSrc || (media as HTMLImageElement).src || "";
-    if (src && !src.includes("avatar") && !src.includes("emoji")) addElement(media.parentElement ?? media, "agent-media");
-  });
-  return list;
-}
-
-/**
  * Runs inside the page. Muse renders source chips as links in their own assistant message item, outside the text bubble,
  * so `innerText` never shows them. Returns the links of the assistant items that follow the last user message.
  */
@@ -244,61 +180,6 @@ export function resolveSourceUrl(href: string): string | null {
     return real.protocol === "http:" || real.protocol === "https:" ? real.href : null;
   } catch {
     return null;
-  }
-}
-
-/** One attached file as a block the relay can cut out of the reply; non-text bytes travel as base64. */
-export function fileBlock(name: string, data: Uint8Array): string {
-  const text = Buffer.from(data).toString("utf8");
-  const plain = !text.includes("\uFFFD") && !text.includes(FILE_END);
-  const safeName = name.replace(/["\r\n]/g, "_");
-  return `[[file name="${safeName}" encoding="${plain ? "utf8" : "base64"}"]]\n${plain ? text : Buffer.from(data).toString("base64")}\n${FILE_END}`;
-}
-
-/**
- * Fetches the files the agent attached this turn through Muse's own file viewer (card -> More actions -> Download), so the
- * bytes are the real file rather than the rendered preview. A card that cannot be downloaded is reported, never skipped silently.
- */
-async function downloadFiles(page: Page, knownCards: number): Promise<string[]> {
-  const cards = page.locator(FILE_CARD);
-  const total = await cards.count();
-  const blocks: string[] = [];
-  for (let index = knownCards; index < Math.min(total, knownCards + FILE_MAX_COUNT); index += 1) {
-    const card = cards.nth(index);
-    const title = await card.locator("[title]").first().getAttribute("title", { timeout: 2_000 }).catch(() => null) ?? `file-${index + 1}`;
-    try {
-      await card.click({ timeout: FILE_STEP_TIMEOUT });
-      await page.locator('button[aria-label="More actions"]').first().click({ timeout: FILE_STEP_TIMEOUT });
-      const [download] = await Promise.all([
-        page.waitForEvent("download", { timeout: FILE_STEP_TIMEOUT }),
-        page.getByRole("menuitem", { name: "Download", exact: true }).click({ timeout: FILE_STEP_TIMEOUT }),
-      ]);
-      const path = await download.path();
-      const data = new Uint8Array(await readFile(path));
-      blocks.push(data.byteLength > FILE_MAX_BYTES ? `[file ${title}: larger than ${FILE_MAX_BYTES} bytes, not attached]` : fileBlock(download.suggestedFilename() || title, data));
-    } catch {
-      blocks.push(`[file ${title}: download failed]`);
-    }
-    await page.locator('button[aria-label="Close"]').first().click({ timeout: 2_000 }).catch(() => {});
-  }
-  return blocks;
-}
-
-/** Runs inside the page: the bytes of one media URL as base64, so `blob:` and `data:` sources work too. */
-async function mediaBytesInPage(src: string): Promise<{ readonly ok: boolean; readonly mime?: string; readonly b64?: string; readonly err?: string }> {
-  try {
-    const response = await fetch(src);
-    if (!response.ok) return { ok: false, err: `media-http-${response.status}` };
-    const blob = await response.blob();
-    const dataUrl = await new Promise<string>((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(String(reader.result));
-      reader.onerror = () => reject(reader.error);
-      reader.readAsDataURL(blob);
-    });
-    return { ok: true, mime: blob.type || "", b64: dataUrl.slice(dataUrl.indexOf(",") + 1) };
-  } catch (error) {
-    return { ok: false, err: String(error) };
   }
 }
 
@@ -332,12 +213,6 @@ async function pruneCurrentThread(page: Page): Promise<boolean> {
   }
 }
 
-function attachmentMime(reported: string | undefined): RunImage["mime"] {
-  if (reported === "image/webp") return "image/webp";
-  if (reported === "image/jpeg") return "image/jpeg";
-  return "image/png";
-}
-
 /** The origin override permits a local synthetic Muse page in adapter tests. */
 export function createMuseAdapter(site = "https://muse.ai", chatTimeout = CHAT_TIMEOUT, pruneThreads = false): ProviderAdapter {
   const origin = new URL(site);
@@ -364,53 +239,6 @@ export function createMuseAdapter(site = "https://muse.ai", chatTimeout = CHAT_T
     // Chrome drops session cookies when the persistent context closes; a future expiry keeps them on disk.
     await browser.addCookies(renewed.map((cookie) => ({ ...cookie, expires: Math.floor(Date.now() / 1000) + 86_400 })));
     context.saveCredentials?.({ ...credentials, cookieHeader: renewed.map((cookie) => `${cookie.name}=${cookie.value}`).join("; ") });
-  }
-
-  async function generatedImages(page: Page, baseline: ReadonlySet<string>, baselineAttachments: number): Promise<RunImage[]> {
-    const collect = async (): Promise<Attachment[]> =>
-      (await page.evaluate(attachmentsInPage)).filter((attachment) =>
-        attachment.src && !attachment.hasVideo && !baseline.has(attachment.src) && !attachment.src.startsWith("data:image/svg"));
-    let fresh = await collect();
-    if (fresh.length === 0) {
-      // A new attachment card means media is still mounting, so it keeps the full wait; otherwise only a short grace.
-      const pending = await page.locator('[data-testid^="hatch-chat-attachment-presentation-"]').count() > baselineAttachments;
-      try {
-        await page.waitForFunction((known: string[]) => {
-          const seen = new Set(known);
-          return [...document.querySelectorAll('div[class*="hatch-agent-bubble-bg"] img, [data-testid^="hatch-chat-attachment-presentation-"] img')]
-            .some((node) => {
-              const src = (node as HTMLImageElement).currentSrc || (node as HTMLImageElement).src || "";
-              return src && !seen.has(src) && !src.includes("avatar") && !src.includes("emoji");
-            });
-        }, [...baseline], { timeout: pending ? ATTACHMENT_TIMEOUT : LATE_IMAGE_GRACE });
-      } catch {
-        // A text-only answer produces no attachment.
-      }
-      fresh = await collect();
-    }
-    if (fresh.length > 0) {
-      // The bytes can arrive before the element reports a size; the size is read after it loads.
-      try {
-        await page.waitForFunction((sources: string[]) => {
-          const wanted = new Set(sources);
-          return [...document.querySelectorAll("img")].some((img) => wanted.has(img.currentSrc || img.src || "") && img.complete && img.naturalWidth > 0);
-        }, fresh.map((attachment) => attachment.src), { timeout: MEDIA_LOAD_TIMEOUT });
-      } catch {
-        // Fetch whatever bytes are reachable even if the element never reports a size.
-      }
-      fresh = await collect();
-    }
-    const images: RunImage[] = [];
-    for (const attachment of fresh.slice(0, MAX_IMAGES)) {
-      const bytes = await page.evaluate(mediaBytesInPage, attachment.src);
-      if (!bytes.ok || !bytes.b64) continue;
-      images.push({
-        mime: attachmentMime(bytes.mime),
-        data: new Uint8Array(Buffer.from(bytes.b64, "base64")),
-        ...(attachment.w > 0 && attachment.h > 0 ? { width: attachment.w, height: attachment.h } : {}),
-      });
-    }
-    return images;
   }
 
   return {
@@ -525,7 +353,7 @@ export function createMuseAdapter(site = "https://muse.ai", chatTimeout = CHAT_T
         // An upload cannot outlast the chat it belongs to, which also keeps the bounded test adapters fast.
         if (references.length) await attachReferences(page, references, Math.min(REFERENCE_UPLOAD_TIMEOUT, chatTimeout));
         // A generated image must be new, not a history attachment or the user's own upload.
-        const baseline = new Set((await page.evaluate(attachmentsInPage)).flatMap((attachment) => [attachment.src, attachment.vSrc, attachment.iSrc]).filter(Boolean));
+        const baseline = new Set((await page.evaluate(attachmentsInPage)).map((attachment) => attachment.src));
         const baselineAttachments = await page.locator('[data-testid^="hatch-chat-attachment-presentation-"]').count();
         const baselineFiles = await page.locator(FILE_CARD).count();
         // Observe the actual Stop control transition, not text stability or a silent timeout.
@@ -561,7 +389,8 @@ export function createMuseAdapter(site = "https://muse.ai", chatTimeout = CHAT_T
           if (!location.pathname.startsWith("/thread/")) throw new Error("Muse left the chat thread.");
           return document.documentElement.dataset["museComplete"] === "true";
         }, null, { timeout: chatTimeout });
-        const images = await generatedImages(page, baseline, baselineAttachments);
+        const media = await generatedMedia(page, { sources: baseline, cards: baselineAttachments });
+        const images = media.images;
         // An image-only answer has no agent text bubble, and waiting for one timed out after the image had arrived.
         const bubbles = page.locator('div[class*="hatch-agent-bubble-bg"]');
         const rawText = await bubbles.count() ? await bubbles.last().innerText({ timeout: 5_000 }) : "";
@@ -570,15 +399,17 @@ export function createMuseAdapter(site = "https://muse.ai", chatTimeout = CHAT_T
           .filter((url): url is string => url !== null && !rawText.includes(url));
         // With the addresses attached, a bare "출처:" label left at the end of the text would only dangle.
         const body = sources.length ? rawText.replace(/\s*(출처|Sources?)\s*[:：]\s*$/i, "").trim() : rawText.trim();
-        const files = await downloadFiles(page, baselineFiles);
-        const text = [body, ...sources.map((url) => `출처: ${url}`), ...files].filter(Boolean).join("\n\n");
-        if (!text.trim() && images.length === 0) throw new GatewayError("muse_result", "Muse finished without text or an image.", 502, true);
+        const downloaded = await downloadFiles(page, baselineFiles, 3 - media.files.length);
+        const files = [...media.files, ...downloaded.files].slice(0, 3);
+        const text = [body, ...sources.map((url) => `출처: ${url}`), ...media.notes, ...downloaded.blocks].filter(Boolean).join("\n\n");
+        if (!text.trim() && images.length === 0 && files.length === 0) throw new GatewayError("muse_result", "Muse finished without text or media.", 502, true);
         const match = /^\/thread\/([^/]+)\/?$/.exec(new URL(page.url()).pathname);
         if (pruneThreads) await pruneCurrentThread(page);
         return {
           text: text.trim(),
           remoteId: match?.[1] && match[1] !== "new" ? match[1] : null,
           ...(images.length ? { images } : {}),
+          ...(files.length ? { files } : {}),
         };
       } catch (error) {
         if (error instanceof GatewayError) {
