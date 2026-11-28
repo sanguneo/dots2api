@@ -29,6 +29,10 @@ export class MuseFollowups {
         created_at INTEGER NOT NULL, PRIMARY KEY(account_id, thread_id, kind, key)
       );
       CREATE TABLE IF NOT EXISTS muse_followup_limits (account_id TEXT PRIMARY KEY, paused_until INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS muse_watch_retired (
+        account_id TEXT NOT NULL, thread_id TEXT NOT NULL, retired_at INTEGER NOT NULL, resumed_at INTEGER,
+        PRIMARY KEY(account_id, thread_id)
+      );
       CREATE UNIQUE INDEX IF NOT EXISTS muse_followup_content ON muse_followup_receipts(account_id, key) WHERE kind='content';
     `);
     this.importLegacy();
@@ -38,6 +42,20 @@ export class MuseFollowups {
     return this.store.db.query<{ paused_until: number }, [string]>(
       "SELECT paused_until FROM muse_followup_limits WHERE account_id=?",
     ).get(accountId)?.paused_until ?? 0;
+  }
+
+  /** An operator reset's retirement of this conversation's earlier work, or null. Rows are written by the reset itself. */
+  retirement(accountId: AccountId, threadId: string): { readonly retiredAt: number; readonly resumedAt: number | null } | null {
+    const row = this.store.db.query<{ retired_at: number; resumed_at: number | null }, [string, string]>(
+      "SELECT retired_at, resumed_at FROM muse_watch_retired WHERE account_id=? AND thread_id=?",
+    ).get(accountId, threadId);
+    return row ? { retiredAt: row.retired_at, resumedAt: row.resumed_at } : null;
+  }
+
+  /** A request created after the retirement reuses the conversation; the cutoff for earlier work is kept. */
+  resume(accountId: AccountId, threadId: string, requestedAt: number): void {
+    this.store.db.query("UPDATE muse_watch_retired SET resumed_at=? WHERE account_id=? AND thread_id=? AND resumed_at IS NULL AND retired_at<?")
+      .run(requestedAt, accountId, threadId, requestedAt);
   }
 
   baseline(accountId: AccountId, threadId: string, hashes: readonly string[]): void {

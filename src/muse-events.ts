@@ -44,7 +44,24 @@ export class MuseEvents {
 
   pending(): Job[] {
     return this.gateway.store.jobs(-1).filter(job => job.followup && !job.followup.deliveredAt &&
-      (job.status !== "unknown" || job.output || job.error));
+      (job.status !== "unknown" || job.output || job.error) && !this.retiredBefore(job));
+  }
+
+  /** An undelivered event from before its conversation was retired stays stored, unacknowledged and undelivered. */
+  private retiredBefore(job: Job): boolean {
+    const retirement = job.remoteId ? this.followups.retirement(job.accountId, job.remoteId) : null;
+    return retirement !== null && Date.parse(job.createdAt) <= retirement.retiredAt;
+  }
+
+  /** A retired conversation publishes nothing new until a request made after the retirement resumes it. */
+  private retired(accountId: AccountId, threadId: string): boolean {
+    const retirement = this.followups.retirement(accountId, threadId);
+    return retirement !== null && retirement.resumedAt === null;
+  }
+
+  /** Called when a foreground request is accepted in a conversation; durable beyond that request's job retention. */
+  resumed(job: Job, threadId: string): void {
+    this.followups.resume(job.accountId, threadId, Date.parse(job.createdAt));
   }
 
   acknowledge(id: Job["id"]): boolean {
@@ -72,7 +89,8 @@ export class MuseEvents {
         abort.signal.throwIfAborted();
         const latest = new Map<string, Job>();
         for (const job of [...this.gateway.store.jobs(-1)].reverse()) {
-          if (job.accountId === account.id && job.remoteId && (!job.followup || job.status === "completed")) latest.set(job.remoteId, job);
+          if (job.accountId === account.id && job.remoteId && (!job.followup || job.status === "completed") &&
+            !this.retired(account.id, job.remoteId)) latest.set(job.remoteId, job);
         }
         const context: MuseWatchContext = {
           accountId: account.id, dataDir: this.gateway.store.dataDir, signal: abort.signal,
@@ -146,6 +164,7 @@ export class MuseEvents {
   }
 
   private result(accountId: AccountId, threadId: string, result: RunResult): void {
+    if (this.retired(accountId, threadId)) return;
     if (result.deliveryId && this.gateway.store.jobs(-1).some(job => job.accountId === accountId &&
       job.remoteId === threadId && job.followup?.deliveryId === result.deliveryId)) return;
     const contentHash = followupContentHash(result);

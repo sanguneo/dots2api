@@ -450,6 +450,7 @@ export class Gateway {
         },
         onAccepted: (id) => {
           remoteId = id;
+          if (job.provider === "muse" && id) this.museEvents.resumed(job, id);
           // Persist the key as soon as Muse creates the chat, including across interrupted jobs/restarts.
           if (sideChat?.thread && id) {
             this.store.saveMuseThread({ accountId: job.accountId, kind: sideChat.kind, key: sideChat.thread, threadId: id, lastUsedAt: this.now() });
@@ -486,6 +487,7 @@ export class Gateway {
       if (sideChat && key && result.remoteId && (sideChat.kind === "image" || sideChat.thread || result.pendingTask)) {
         this.store.saveMuseThread({ accountId: job.accountId, kind: sideChat.kind, key, threadId: result.remoteId, lastUsedAt: this.now() });
       }
+      if (job.provider === "muse" && result.remoteId) this.museEvents.resumed(job, result.remoteId);
       return this.store.saveJob({
         ...job, status: "completed", output: result.text + note, remoteId: result.remoteId, images, files,
         ...(result.pendingTask ? { pendingTask: true } : {}), finishedAt: new Date().toISOString(),
